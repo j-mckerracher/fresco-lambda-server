@@ -1,10 +1,8 @@
-print("v1")
 import asyncio
 import json
 import os
 import aioboto3
 import sqlparse
-import jwt  # PyJWT library
 from typing import List, Any, Dict
 from botocore.exceptions import ClientError
 from urllib.parse import unquote_plus
@@ -21,13 +19,14 @@ Required env vars:
 'DB_USER'
 'DB_PW'
 'DB_PORT'
-'JWT_SECRET'
-'JWT_ISSUER'
 'CHUNK_SIZE'
 'WEBSOCKET_API_ID'
 'WEBSOCKET_STAGE'
 'REGION'
 """
+
+# Global set to store connection IDs
+connection_ids = set()
 
 
 # Function to parse and validate the SQL query
@@ -50,27 +49,6 @@ def is_query_safe(query: str) -> bool:
     return True
 
 
-# Function to extract and validate connection IDs from JWT token
-def extract_connection_ids(event) -> List[str]:
-    """
-    Extract and validate connection IDs from the Authorization header.
-    """
-    token = event.get('headers', {}).get('Authorization')
-    if not token:
-        raise ValueError('Missing Authorization token')
-    try:
-        secret = os.environ['JWT_SECRET']
-        issuer = os.environ.get('JWT_ISSUER', 'your-issuer')
-        payload = jwt.decode(token, secret, algorithms=['HS256'], issuer=issuer)
-        connection_ids = payload.get('connection_ids')
-        if not isinstance(connection_ids, list) or not connection_ids:
-            raise ValueError('Invalid connection IDs in token')
-        # Limit to a maximum of 6 connections
-        return connection_ids[:6]
-    except jwt.InvalidTokenError as e:
-        raise ValueError(f'Invalid token: {e}')
-
-
 # Main Lambda handler
 def lambda_handler(event, context):
     request_context = event.get('requestContext', {})
@@ -82,7 +60,7 @@ def lambda_handler(event, context):
         elif route_key == '$disconnect':
             return handle_disconnect(event)
         elif route_key == '$default':
-            return asyncio.run(handle_default(event))
+            return handle_default(event)
         else:
             return {
                 'statusCode': 400,
@@ -99,8 +77,8 @@ def handle_connect(event):
     Store the connection ID for later use.
     """
     connection_id = event['requestContext']['connectionId']
-    # Store the connection ID in a database or cache (e.g., DynamoDB)
-    # For simplicity, this example does not implement storage
+    connection_ids.add(connection_id)
+    print(f"Connection established: {connection_id}")
     return {
         'statusCode': 200,
         'body': 'Connected'
@@ -113,20 +91,21 @@ def handle_disconnect(event):
     Remove the connection ID from storage.
     """
     connection_id = event['requestContext']['connectionId']
-    # Remove the connection ID from storage
+    if connection_id in connection_ids:
+        connection_ids.remove(connection_id)
+        print(f"Connection disconnected: {connection_id}")
     return {
         'statusCode': 200,
         'body': 'Disconnected'
     }
 
 
-async def handle_default(event):
+def handle_default(event):
     """
     Handle WebSocket $default event.
     This can be used to process messages sent by clients.
     """
-    connection_id = event['requestContext']['connectionId']
-    # Process the incoming message if needed
+    # For simplicity, we'll just acknowledge the message
     return {
         'statusCode': 200,
         'body': 'Message received'
@@ -136,6 +115,7 @@ async def handle_default(event):
 async def main_handler(event) -> Dict[str, Any]:
     """
     Asynchronous main handler for the Lambda function.
+    Processes HTTP GET requests with a SQL query and streams data over WebSocket connections.
     """
     engine = None  # Initialize engine variable for cleanup
     try:
@@ -159,13 +139,11 @@ async def main_handler(event) -> Dict[str, Any]:
         # Append LIMIT clause to ensure maximum of one million rows
         query_with_limit = f"SELECT * FROM ({query}) AS sub LIMIT 1000000"
 
-        # Extract and validate connection IDs from token
-        try:
-            connection_ids = extract_connection_ids(event)
-        except ValueError as e:
+        # Get the list of current connection IDs
+        if not connection_ids:
             return {
-                'statusCode': 401,
-                'body': json.dumps({'error': str(e)})
+                'statusCode': 400,
+                'body': json.dumps({'error': 'No active WebSocket connections'})
             }
 
         # Configure chunk size
@@ -185,26 +163,32 @@ async def main_handler(event) -> Dict[str, Any]:
 
         async with engine.connect() as conn:
             # Use stream_results to fetch data in chunks
-            result = await conn.execute(
-                text(query_with_limit).execution_options(stream_results=True)
-            )
+            result = await conn.stream(text(query_with_limit))
+
             sequence_id = 0
 
             # Set up the API Gateway Management API client
             endpoint = f"https://{os.environ['WEBSOCKET_API_ID']}.execute-api.{os.environ['REGION']}.amazonaws.com/{os.environ['WEBSOCKET_STAGE']}"
-            session = aioboto3.session.Session()
+            session = aioboto3.Session()
             async with session.client('apigatewaymanagementapi', endpoint_url=endpoint) as apigw_management_api:
 
                 # Fetch and send data in chunks
                 async for chunk in result.partitions(chunk_size):
-                    # Prepare the message
+                    # Prepare the message with sequence_id and data
                     message = {
                         'sequence_id': sequence_id,
                         'data': [dict(row) for row in chunk]
                     }
                     # Send the message over WebSocket connections
-                    await send_message_to_connections(apigw_management_api, connection_ids, message)
+                    await send_message_to_connections(apigw_management_api, list(connection_ids), message)
                     sequence_id += 1
+
+                # After all data chunks have been sent, send a completion message
+                completion_message = {
+                    'type': 'completion',
+                    'message': 'All data chunks have been sent.'
+                }
+                await send_message_to_connections(apigw_management_api, list(connection_ids), completion_message)
 
         return {
             'statusCode': 200,
@@ -259,7 +243,7 @@ async def send_message_to_connections(apigw_management_api, connection_ids: List
         if isinstance(result, Exception):
             failed_connection_id = connection_ids[idx]
             print(f"Removing failed connection: {failed_connection_id}")
-            # Optionally, remove the connection ID from the list or notify the client
+            # Remove the connection ID from the global set
             connection_ids.remove(failed_connection_id)
 
 
@@ -280,3 +264,4 @@ async def send_message(apigw_management_api, connection_id: str, message: Dict[s
         else:
             print(f"Error sending message to {connection_id}: {e.response['Error']['Message']}")
             raise e
+
