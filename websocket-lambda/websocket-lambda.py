@@ -1,8 +1,7 @@
 import os
-import aioboto3
+import boto3
 import jwt
-import asyncio
-import time  # Ensure time module is imported
+import time
 
 
 def lambda_handler(event, context):
@@ -72,7 +71,7 @@ def handle_connect(event):
         if decoded_token.get('clientId') != client_id:
             print("clientId in token does not match query parameter.")
             raise ValueError("clientId does not match token")
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError, ValueError) as e:
+    except Exception as e:
         print(f"JWT decoding error: {str(e)}")
         return {
             'statusCode': 401,
@@ -81,7 +80,14 @@ def handle_connect(event):
 
     # Store connectionId and clientId in DynamoDB
     print(f"Adding connection {connection_id} for client {client_id} to DynamoDB.")
-    asyncio.run(add_connection(connection_id, client_id))
+    try:
+        add_connection(connection_id, client_id)
+    except Exception as e:
+        print(f"Error adding connection to DynamoDB: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': f'Internal Server Error: {str(e)}'
+        }
 
     return {
         'statusCode': 200,
@@ -96,7 +102,14 @@ def handle_disconnect(event):
 
     # Remove connectionId from DynamoDB
     print(f"Removing connection {connection_id} from DynamoDB.")
-    asyncio.run(remove_connection(connection_id))
+    try:
+        remove_connection(connection_id)
+    except Exception as e:
+        print(f"Error removing connection from DynamoDB: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': f'Internal Server Error: {str(e)}'
+        }
 
     return {
         'statusCode': 200,
@@ -112,7 +125,7 @@ def handle_default(event):
     }
 
 
-async def add_connection(connection_id: str, client_id: str):
+def add_connection(connection_id: str, client_id: str):
     """
     Add a new connectionId and clientId to the DynamoDB table.
     """
@@ -122,20 +135,21 @@ async def add_connection(connection_id: str, client_id: str):
     ttl_value = int(time.time()) + 3600  # Set TTL to 1 hour from now
     print(f"DynamoDB Table: {dynamodb_table}, Region: {region}, TTL: {ttl_value}")
 
-    async with aioboto3.resource('dynamodb', region_name=region) as dynamodb:
-        table = await dynamodb.Table(dynamodb_table)
-        print("Putting item into DynamoDB table.")
-        await table.put_item(
-            Item={
-                'connectionId': connection_id,
-                'clientId': client_id,
-                'ttl': ttl_value
-            }
-        )
-        print(f"Connection {connection_id} added to DynamoDB successfully.")
+    # Initialize boto3 DynamoDB resource
+    dynamodb = boto3.resource('dynamodb', region_name=region)
+    table = dynamodb.Table(dynamodb_table)
+    print("Putting item into DynamoDB table.")
+    table.put_item(
+        Item={
+            'connectionId': connection_id,
+            'clientId': client_id,
+            'ttl': ttl_value
+        }
+    )
+    print(f"Connection {connection_id} added to DynamoDB successfully.")
 
 
-async def remove_connection(connection_id: str):
+def remove_connection(connection_id: str):
     """
     Remove a connectionId from the DynamoDB table.
     """
@@ -144,12 +158,13 @@ async def remove_connection(connection_id: str):
     region = os.environ['REGION']
     print(f"DynamoDB Table: {dynamodb_table}, Region: {region}")
 
-    async with aioboto3.resource('dynamodb', region_name=region) as dynamodb:
-        table = await dynamodb.Table(dynamodb_table)
-        print(f"Deleting connection {connection_id} from DynamoDB table.")
-        await table.delete_item(
-            Key={
-                'connectionId': connection_id
-            }
-        )
-        print(f"Connection {connection_id} removed from DynamoDB successfully.")
+    # Initialize boto3 DynamoDB resource
+    dynamodb = boto3.resource('dynamodb', region_name=region)
+    table = dynamodb.Table(dynamodb_table)
+    print(f"Deleting connection {connection_id} from DynamoDB table.")
+    table.delete_item(
+        Key={
+            'connectionId': connection_id
+        }
+    )
+    print(f"Connection {connection_id} removed from DynamoDB successfully.")
