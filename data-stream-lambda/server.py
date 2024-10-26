@@ -8,7 +8,10 @@ from botocore.exceptions import ClientError
 from urllib.parse import unquote_plus
 from sqlparse.tokens import Token
 import jwt  # Requires PyJWT library
-import time
+import datetime
+import decimal
+import uuid
+import traceback
 
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
@@ -29,6 +32,7 @@ Required environment variables:
 - JWT_SECRET
 - JWT_ISSUER
 """
+ROW_LIMIT = 10000
 
 
 # Function to parse and validate the SQL query
@@ -39,23 +43,35 @@ def is_query_safe(query: str) -> bool:
     print("Validating SQL query for safety.")
     parsed = sqlparse.parse(query)
     print(f"Parsed SQL statements count: {len(parsed)}")
+
     if len(parsed) != 1:
         print("Unsafe query: Multiple SQL statements detected.")
         return False  # Only allow single statements
+
     stmt = parsed[0]
     stmt_type = stmt.get_type()
     print(f"SQL statement type: {stmt_type}")
+
     if stmt_type != 'SELECT':
         print("Unsafe query: Only SELECT statements are allowed.")
         return False
-    # Check for disallowed tokens
+
+    # Define a list of disallowed keywords
+    disallowed_keywords = [
+        'INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE',
+        'TRUNCATE', 'EXECUTE', 'GRANT', 'REVOKE', 'MERGE', 'CALL'
+    ]
+
     for token in stmt.flatten():
-        if token.ttype in [Token.Keyword.DDL, Token.Keyword.DML]:
-            print(f"Unsafe query: Disallowed token detected - {token.value}")
+        # Check for disallowed keywords
+        if token.ttype == Token.Keyword and token.value.upper() in disallowed_keywords:
+            print(f"Unsafe query: Disallowed keyword detected - {token.value}")
             return False
+        # Prevent use of semicolons to avoid statement chaining
         if token.match(Token.Punctuation, ';'):
             print("Unsafe query: Semicolon detected, which is not allowed.")
             return False
+
     print("SQL query is deemed safe.")
     return True
 
@@ -63,35 +79,104 @@ def is_query_safe(query: str) -> bool:
 # Main Lambda handler
 def lambda_handler(event, context):
     print("Lambda handler invoked.")
+    print(f"Incoming event: {json.dumps(event)}")
+    print(f"aioboto3 attributes: {dir(aioboto3)}")
+    print(f"aioboto3.Session attributes: {dir(aioboto3.Session())}")
     request_context = event.get('requestContext', {})
-    if 'routeKey' in request_context and 'routeKey' in event:
+
+    if 'http' in request_context:
+        print("Detected HTTP API event.")
+        return asyncio.run(main_handler(event))
+    else:
         print("Invalid request to data Lambda: WebSocket event received.")
         return {
             'statusCode': 400,
             'body': 'Invalid request'
         }
-    else:
-        # This is an HTTP API event
+
+
+def lambda_handler(event, context):
+    print("Lambda handler invoked.")
+    print(f"Incoming event: {json.dumps(event)}")
+    print(f"aioboto3 attributes: {dir(aioboto3)}")
+    print(f"aioboto3.Session attributes: {dir(aioboto3.Session())}")
+    request_context = event.get('requestContext', {})
+
+    if 'http' in request_context:
         print("Detected HTTP API event.")
         return asyncio.run(main_handler(event))
+    else:
+        print("Invalid request to data Lambda: WebSocket event received.")
+        return {
+            'statusCode': 400,
+            'body': 'Invalid request'
+        }
+
+
+def lambda_handler(event, context):
+    print("Lambda handler invoked.")
+    print(f"Incoming event: {json.dumps(event)}")
+    print(f"aioboto3 attributes: {dir(aioboto3)}")
+    print(f"aioboto3.Session attributes: {dir(aioboto3.Session())}")
+    request_context = event.get('requestContext', {})
+
+    if 'http' in request_context:
+        print("Detected HTTP API event.")
+        return asyncio.run(main_handler(event))
+    else:
+        print("Invalid request to data Lambda: WebSocket event received.")
+        return {
+            'statusCode': 400,
+            'body': 'Invalid request'
+        }
+
+
+def lambda_handler(event, context):
+    print("Lambda handler invoked.")
+    print(f"Incoming event: {json.dumps(event)}")
+    print(f"aioboto3 attributes: {dir(aioboto3)}")
+    print(f"aioboto3.Session attributes: {dir(aioboto3.Session())}")
+    request_context = event.get('requestContext', {})
+
+    if 'http' in request_context:
+        print("Detected HTTP API event.")
+        return asyncio.run(main_handler(event))
+    else:
+        print("Invalid request to data Lambda: WebSocket event received.")
+        return {
+            'statusCode': 400,
+            'body': 'Invalid request'
+        }
 
 
 async def main_handler(event) -> Dict[str, Any]:
     print("Entered main_handler function.")
-    engine = None  # Initialize engine variable for cleanup
+    engine = None
     try:
-        # Extract the HTTP method and path
-        http_method = event.get('requestContext', {}).get('http', {}).get('method')
-        path = event.get('rawPath', '')
-        print(f"HTTP Method: {http_method}, Path: {path}")
+        # Extract the routeKey
+        route_key = event.get('routeKey', '')
+        print(f"Route Key: {route_key}")
 
-        if http_method != 'GET':
+        # Split the routeKey into method and path
+        try:
+            http_method, path = route_key.split(' ', 1)
+            print(f"HTTP Method: {http_method}, Path: {path}")
+        except ValueError:
+            print("Invalid routeKey format.")
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'Bad Request'})
+            }
+
+        # Validate HTTP method
+        if http_method.upper() != 'GET':
             print(f"Unsupported HTTP method: {http_method}")
             return {
                 'statusCode': 405,
                 'body': json.dumps({'error': 'Method Not Allowed'})
             }
 
+        # Validate path
         if path != '/data':
             print(f"Unsupported path: {path}")
             return {
@@ -100,8 +185,11 @@ async def main_handler(event) -> Dict[str, Any]:
             }
 
         print("Proceeding with data streaming.")
-        # Extract clientId from Authorization header
-        auth_header = event.get('headers', {}).get('Authorization')
+        # Extract clientId from Authorization header (case-insensitive)
+        headers = event.get('headers', {})
+        # Normalize headers to lowercase for case-insensitive access
+        headers_lower = {k.lower(): v for k, v in headers.items()}
+        auth_header = headers_lower.get('authorization')
         print(f"Authorization header: {auth_header}")
         if not auth_header:
             print("Authorization header missing.")
@@ -162,9 +250,23 @@ async def main_handler(event) -> Dict[str, Any]:
                 'body': json.dumps({'error': 'Unsafe query'})
             }
 
-        # Append LIMIT clause to ensure maximum of one million rows
-        query_with_limit = f"SELECT * FROM ({query}) AS sub LIMIT 1000000"
-        print(f"SQL query with LIMIT: {query_with_limit}")
+        # Check if the original query already has a LIMIT clause
+        parsed = sqlparse.parse(query)
+        stmt = parsed[0]
+        has_limit = False
+        for token in stmt.flatten():
+            if token.ttype == Token.Keyword and token.value.upper() == 'LIMIT':
+                has_limit = True
+                break
+
+        if not has_limit:
+            # Append LIMIT clause to ensure a maximum of one million rows
+            query_with_limit = f"{query} LIMIT {ROW_LIMIT};"
+            print(f"SQL query with LIMIT: {query_with_limit}")
+        else:
+            # Use the original query as is
+            query_with_limit = f"{query};"
+            print(f"SQL query without appending LIMIT: {query_with_limit}")
 
         # Retrieve all active connectionIds for the clientId
         print(f"Retrieving active WebSocket connections for clientId: {client_id}")
@@ -197,31 +299,117 @@ async def main_handler(event) -> Dict[str, Any]:
 
         async with engine.connect() as conn:
             print("Connected to the database.")
-            # Use stream_results to fetch data in chunks
             print(f"Executing SQL query: {query_with_limit}")
-            result = await conn.stream(text(query_with_limit))
+            # Execute the query asynchronously
+            result = await conn.execute(text(query_with_limit))
             print("SQL query executed successfully.")
 
             sequence_id = 0
 
-            # Set up the API Gateway Management API client
             endpoint = f"https://{os.environ['WEBSOCKET_API_ID']}.execute-api.{os.environ['REGION']}.amazonaws.com/{os.environ['WEBSOCKET_STAGE']}"
             print(f"API Gateway Management API endpoint: {endpoint}")
+
             session = aioboto3.Session()
             async with session.client('apigatewaymanagementapi', endpoint_url=endpoint) as apigw_management_api:
                 print("API Gateway Management API client created.")
-                # Fetch and send data in chunks
-                async for chunk in result.partitions(chunk_size):
-                    print(f"Fetched chunk with {len(chunk)} rows.")
-                    # Prepare the message with sequence_id and data
+
+                # Retrieve column names once
+                column_names = result.keys()
+                print(f"Column Names: {column_names}")
+
+                chunk_data = []
+                # Replace async for with fetchmany
+                while True:
+                    # Fetch a batch of rows
+                    rows = await conn.run_sync(lambda sync_conn: result.fetchmany(1000))
+                    if not rows:
+                        break
+
+                    for row in rows:
+                        try:
+                            # Manually map column names to row values
+                            row_dict = dict(zip(column_names, row))
+                            print(f"Processing row_dict: {row_dict}")
+
+                            # Handle special data types that aren't JSON serializable
+                            for key, value in row_dict.items():
+                                if isinstance(value, (datetime.datetime, datetime.date)):
+                                    row_dict[key] = value.isoformat()
+                                elif isinstance(value, decimal.Decimal):
+                                    row_dict[key] = float(value)
+                                elif isinstance(value, uuid.UUID):
+                                    row_dict[key] = str(value)
+                            chunk_data.append(row_dict)
+                        except Exception as e:
+                            print(f"Error converting row to dict: {e}")
+                            continue
+
+                        # Check if chunk_size is reached
+                        if len(chunk_data) >= chunk_size:
+                            message = {
+                                'sequence_id': sequence_id,
+                                'data': chunk_data
+                            }
+
+                            print(f"Prepared message for sequence_id {sequence_id} with {len(chunk_data)} rows")
+                            if chunk_data:
+                                print(f"Sample of first row in chunk: {json.dumps(chunk_data[0], default=str)}")
+
+                            # Send the message over WebSocket connections
+                            await send_message_to_connections(apigw_management_api, connection_ids, message)
+                            print(f"Sent message for sequence_id {sequence_id} to connections")
+                            sequence_id += 1
+                            chunk_data = []  # Reset chunk data
+                async for row in result:
+                    try:
+                        # Manually map column names to row values
+                        row_dict = dict(zip(column_names, row))
+                        print(f"Processing row_dict: {row_dict}")
+
+                        # Handle special data types that aren't JSON serializable
+                        for key, value in row_dict.items():
+                            if isinstance(value, (datetime.datetime, datetime.date)):
+                                row_dict[key] = value.isoformat()
+                            elif isinstance(value, decimal.Decimal):
+                                row_dict[key] = float(value)
+                            elif isinstance(value, uuid.UUID):
+                                row_dict[key] = str(value)
+                        chunk_data.append(row_dict)
+                    except Exception as e:
+                        print(f"Error converting row to dict: {e}")
+                        continue  # Skip this row or handle accordingly
+
+                    # Check if chunk_size is reached
+                    if len(chunk_data) >= chunk_size:
+                        message = {
+                            'sequence_id': sequence_id,
+                            'data': chunk_data
+                        }
+
+                        print(f"Prepared message for sequence_id {sequence_id} with {len(chunk_data)} rows")
+                        if chunk_data:
+                            print(f"Sample of first row in chunk: {json.dumps(chunk_data[0], default=str)}")
+
+                        # Send the message over WebSocket connections
+                        await send_message_to_connections(apigw_management_api, connection_ids, message)
+                        print(f"Sent message for sequence_id {sequence_id} to connections")
+                        sequence_id += 1
+                        chunk_data = []  # Reset chunk data
+
+                # Send any remaining data
+                if chunk_data:
                     message = {
                         'sequence_id': sequence_id,
-                        'data': [dict(row) for row in chunk]
+                        'data': chunk_data
                     }
-                    print(f"Prepared message for sequence_id {sequence_id}: {message}")
+
+                    print(f"Prepared message for sequence_id {sequence_id} with {len(chunk_data)} rows")
+                    if chunk_data:
+                        print(f"Sample of first row in chunk: {json.dumps(chunk_data[0], default=str)}")
+
                     # Send the message over WebSocket connections
                     await send_message_to_connections(apigw_management_api, connection_ids, message)
-                    print(f"Sent message for sequence_id {sequence_id} to connections.")
+                    print(f"Sent message for sequence_id {sequence_id} to connections")
                     sequence_id += 1
 
                 # After all data chunks have been sent, send a completion message
@@ -229,9 +417,9 @@ async def main_handler(event) -> Dict[str, Any]:
                     'type': 'completion',
                     'message': 'All data chunks have been sent.'
                 }
-                print("Sending completion message to all connections.")
+                print("Sending completion message to all connections")
                 await send_message_to_connections(apigw_management_api, connection_ids, completion_message)
-                print("Completion message sent to all connections.")
+                print("Completion message sent to all connections")
 
         print("Data streaming completed successfully.")
         return {
@@ -264,10 +452,12 @@ async def main_handler(event) -> Dict[str, Any]:
             'body': json.dumps({'error': str(e)})
         }
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"Unexpected error during data streaming: {str(e)}")
+        print(f"Error type: {type(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
         return {
             'statusCode': 500,
-            'body': json.dumps({'error': 'An unexpected error occurred'})
+            'body': json.dumps({'error': str(e)})
         }
     finally:
         if engine:
@@ -285,7 +475,8 @@ async def remove_connection(connection_id: str):
     region = os.environ['REGION']
     print(f"DynamoDB Table: {dynamodb_table}, Region: {region}")
 
-    async with aioboto3.resource('dynamodb', region_name=region) as dynamodb:
+    session = aioboto3.Session()
+    async with session.resource('dynamodb', region_name=region) as dynamodb:
         table = await dynamodb.Table(dynamodb_table)
         print("Deleting item from DynamoDB table.")
         await table.delete_item(
@@ -346,24 +537,28 @@ async def send_message(apigw_management_api, connection_id: str, message: Dict[s
 
 
 async def get_client_connections(client_id: str) -> List[str]:
-    """
-    Retrieve all active connectionIds associated with a clientId.
-    """
     print(f"Retrieving connections for clientId: {client_id}")
     dynamodb_table = os.environ['DYNAMODB_TABLE']
     region = os.environ['REGION']
     print(f"DynamoDB Table: {dynamodb_table}, Region: {region}")
 
-    async with aioboto3.resource('dynamodb', region_name=region) as dynamodb:
+    session = aioboto3.Session()
+    async with session.resource('dynamodb', region_name=region) as dynamodb:
         table = await dynamodb.Table(dynamodb_table)
         print("Querying DynamoDB for active connections.")
-        response = await table.query(
-            IndexName='ClientIdIndex',
-            KeyConditionExpression='clientId = :cid',
-            ExpressionAttributeValues={
-                ':cid': client_id
-            }
-        )
+        try:
+            response = await table.query(
+                IndexName='ClientIdIndex',
+                KeyConditionExpression='clientId = :cid',
+                ExpressionAttributeValues={
+                    ':cid': client_id
+                }
+            )
+            print("DynamoDB query successful.")
+        except Exception as e:
+            print(f"DynamoDB query failed: {e}")
+            raise e  # Re-raise to be caught by the outer try-except
+
         items = response.get('Items', [])
         print(f"Number of connections retrieved: {len(items)}")
         connection_ids = [item['connectionId'] for item in items]
