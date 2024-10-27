@@ -2,5 +2,4 @@ sqlparse~=0.5.1
 boto3
 aioboto3~=13.2.0
 PyJWT~=2.9.0
-SQLAlchemy~=2.0.36
 asyncpg

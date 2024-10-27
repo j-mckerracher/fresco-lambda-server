@@ -12,10 +12,7 @@ import datetime
 import decimal
 import uuid
 import traceback
-
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy import text
-from sqlalchemy.exc import OperationalError, DatabaseError, SQLAlchemyError
+import asyncpg
 
 """
 Required environment variables:
@@ -32,7 +29,7 @@ Required environment variables:
 - JWT_SECRET
 - JWT_ISSUER
 """
-ROW_LIMIT = 10000
+ROW_LIMIT = 10
 
 
 # Function to parse and validate the SQL query
@@ -80,62 +77,6 @@ def is_query_safe(query: str) -> bool:
 def lambda_handler(event, context):
     print("Lambda handler invoked.")
     print(f"Incoming event: {json.dumps(event)}")
-    print(f"aioboto3 attributes: {dir(aioboto3)}")
-    print(f"aioboto3.Session attributes: {dir(aioboto3.Session())}")
-    request_context = event.get('requestContext', {})
-
-    if 'http' in request_context:
-        print("Detected HTTP API event.")
-        return asyncio.run(main_handler(event))
-    else:
-        print("Invalid request to data Lambda: WebSocket event received.")
-        return {
-            'statusCode': 400,
-            'body': 'Invalid request'
-        }
-
-
-def lambda_handler(event, context):
-    print("Lambda handler invoked.")
-    print(f"Incoming event: {json.dumps(event)}")
-    print(f"aioboto3 attributes: {dir(aioboto3)}")
-    print(f"aioboto3.Session attributes: {dir(aioboto3.Session())}")
-    request_context = event.get('requestContext', {})
-
-    if 'http' in request_context:
-        print("Detected HTTP API event.")
-        return asyncio.run(main_handler(event))
-    else:
-        print("Invalid request to data Lambda: WebSocket event received.")
-        return {
-            'statusCode': 400,
-            'body': 'Invalid request'
-        }
-
-
-def lambda_handler(event, context):
-    print("Lambda handler invoked.")
-    print(f"Incoming event: {json.dumps(event)}")
-    print(f"aioboto3 attributes: {dir(aioboto3)}")
-    print(f"aioboto3.Session attributes: {dir(aioboto3.Session())}")
-    request_context = event.get('requestContext', {})
-
-    if 'http' in request_context:
-        print("Detected HTTP API event.")
-        return asyncio.run(main_handler(event))
-    else:
-        print("Invalid request to data Lambda: WebSocket event received.")
-        return {
-            'statusCode': 400,
-            'body': 'Invalid request'
-        }
-
-
-def lambda_handler(event, context):
-    print("Lambda handler invoked.")
-    print(f"Incoming event: {json.dumps(event)}")
-    print(f"aioboto3 attributes: {dir(aioboto3)}")
-    print(f"aioboto3.Session attributes: {dir(aioboto3.Session())}")
     request_context = event.get('requestContext', {})
 
     if 'http' in request_context:
@@ -150,8 +91,7 @@ def lambda_handler(event, context):
 
 
 async def main_handler(event) -> Dict[str, Any]:
-    print("Entered main_handler function.")
-    engine = None
+    conn = None
     try:
         # Extract the routeKey
         route_key = event.get('routeKey', '')
@@ -260,7 +200,7 @@ async def main_handler(event) -> Dict[str, Any]:
                 break
 
         if not has_limit:
-            # Append LIMIT clause to ensure a maximum of one million rows
+            # Append LIMIT clause to ensure a maximum of ROW_LIMIT rows
             query_with_limit = f"{query} LIMIT {ROW_LIMIT};"
             print(f"SQL query with LIMIT: {query_with_limit}")
         else:
@@ -283,66 +223,56 @@ async def main_handler(event) -> Dict[str, Any]:
         chunk_size = int(os.environ.get('CHUNK_SIZE', '10000'))  # Default to 10,000
         print(f"Configured chunk size: {chunk_size}")
 
-        # Build the database URL
-        user = os.environ['DB_USER']
-        password = os.environ['DB_PASSWORD']
-        host = os.environ['DB_HOST']
-        port = os.environ['DB_PORT']
-        dbname = os.environ['DB_NAME']
-        print("Building database URL.")
-        database_url = f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{dbname}"
-        print(f"Database URL: {database_url}")
+        # Initialize sequence_id
+        sequence_id = 0
 
-        # Create the async engine
-        print("Creating asynchronous database engine.")
-        engine = create_async_engine(database_url, echo=False)
+        # Configure API Gateway endpoint
+        endpoint = f"https://{os.environ['WEBSOCKET_API_ID']}.execute-api.{os.environ['REGION']}.amazonaws.com/{os.environ['WEBSOCKET_STAGE']}"
+        print(f"API Gateway Management API endpoint: {endpoint}")
 
-        async with engine.connect() as conn:
-            print("Connected to the database.")
-            print(f"Executing SQL query: {query_with_limit}")
-            # Execute the query asynchronously
-            result = await conn.execute(text(query_with_limit))
-            print("SQL query executed successfully.")
+        # Create database connection
+        print("Establishing database connection.")
+        conn = await asyncpg.connect(
+            user=os.environ['DB_USER'],
+            password=os.environ['DB_PASSWORD'],
+            host=os.environ['DB_HOST'],
+            port=os.environ['DB_PORT'],
+            database=os.environ['DB_NAME']
+        )
+        print("Database connection established.")
 
-            sequence_id = 0
+        # Create API Gateway management client
+        session = aioboto3.Session()
+        async with session.client('apigatewaymanagementapi', endpoint_url=endpoint) as apigw_management_api:
+            print("API Gateway Management API client created.")
 
-            endpoint = f"https://{os.environ['WEBSOCKET_API_ID']}.execute-api.{os.environ['REGION']}.amazonaws.com/{os.environ['WEBSOCKET_STAGE']}"
-            print(f"API Gateway Management API endpoint: {endpoint}")
-
-            session = aioboto3.Session()
-            async with session.client('apigatewaymanagementapi', endpoint_url=endpoint) as apigw_management_api:
-                print("API Gateway Management API client created.")
-
-                # Retrieve column names once
-                column_names = result.keys()
-                print(f"Column Names: {column_names}")
-
+            # Use a server-side cursor for memory efficiency
+            async with conn.transaction():
+                print(f"Executing query: {query_with_limit}")
+                # Initialize chunk_data outside the loop
                 chunk_data = []
-                # Replace async for with fetchmany
-                while True:
-                    # Fetch a batch of rows
-                    rows = await conn.run_sync(lambda sync_conn: result.fetchmany(1000))
-                    if not rows:
-                        break
 
-                    for row in rows:
-                        try:
-                            # Manually map column names to row values
-                            row_dict = dict(zip(column_names, row))
-                            print(f"Processing row_dict: {row_dict}")
+                # Use cursor with prefetch
+                async for record in conn.cursor(
+                        query_with_limit,
+                        prefetch=chunk_size
+                ):
+                    try:
+                        # Convert record to dict
+                        row_dict = dict(record)
 
-                            # Handle special data types that aren't JSON serializable
-                            for key, value in row_dict.items():
-                                if isinstance(value, (datetime.datetime, datetime.date)):
-                                    row_dict[key] = value.isoformat()
-                                elif isinstance(value, decimal.Decimal):
-                                    row_dict[key] = float(value)
-                                elif isinstance(value, uuid.UUID):
-                                    row_dict[key] = str(value)
-                            chunk_data.append(row_dict)
-                        except Exception as e:
-                            print(f"Error converting row to dict: {e}")
-                            continue
+                        # Handle special data types
+                        for key, value in row_dict.items():
+                            if isinstance(value, (datetime.datetime, datetime.date)):
+                                row_dict[key] = value.isoformat()
+                            elif isinstance(value, decimal.Decimal):
+                                row_dict[key] = float(value)
+                            elif isinstance(value, uuid.UUID):
+                                row_dict[key] = str(value)
+                            elif isinstance(value, bytes):
+                                row_dict[key] = value.decode('utf-8')
+
+                        chunk_data.append(row_dict)
 
                         # Check if chunk_size is reached
                         if len(chunk_data) >= chunk_size:
@@ -360,41 +290,11 @@ async def main_handler(event) -> Dict[str, Any]:
                             print(f"Sent message for sequence_id {sequence_id} to connections")
                             sequence_id += 1
                             chunk_data = []  # Reset chunk data
-                async for row in result:
-                    try:
-                        # Manually map column names to row values
-                        row_dict = dict(zip(column_names, row))
-                        print(f"Processing row_dict: {row_dict}")
 
-                        # Handle special data types that aren't JSON serializable
-                        for key, value in row_dict.items():
-                            if isinstance(value, (datetime.datetime, datetime.date)):
-                                row_dict[key] = value.isoformat()
-                            elif isinstance(value, decimal.Decimal):
-                                row_dict[key] = float(value)
-                            elif isinstance(value, uuid.UUID):
-                                row_dict[key] = str(value)
-                        chunk_data.append(row_dict)
                     except Exception as e:
-                        print(f"Error converting row to dict: {e}")
-                        continue  # Skip this row or handle accordingly
-
-                    # Check if chunk_size is reached
-                    if len(chunk_data) >= chunk_size:
-                        message = {
-                            'sequence_id': sequence_id,
-                            'data': chunk_data
-                        }
-
-                        print(f"Prepared message for sequence_id {sequence_id} with {len(chunk_data)} rows")
-                        if chunk_data:
-                            print(f"Sample of first row in chunk: {json.dumps(chunk_data[0], default=str)}")
-
-                        # Send the message over WebSocket connections
-                        await send_message_to_connections(apigw_management_api, connection_ids, message)
-                        print(f"Sent message for sequence_id {sequence_id} to connections")
-                        sequence_id += 1
-                        chunk_data = []  # Reset chunk data
+                        print(f"Error processing record: {e}")
+                        print(f"Traceback: {traceback.format_exc()}")
+                        continue
 
                 # Send any remaining data
                 if chunk_data:
@@ -403,16 +303,15 @@ async def main_handler(event) -> Dict[str, Any]:
                         'data': chunk_data
                     }
 
-                    print(f"Prepared message for sequence_id {sequence_id} with {len(chunk_data)} rows")
+                    print(f"Prepared final message for sequence_id {sequence_id} with {len(chunk_data)} rows")
                     if chunk_data:
-                        print(f"Sample of first row in chunk: {json.dumps(chunk_data[0], default=str)}")
+                        print(f"Sample of first row in final chunk: {json.dumps(chunk_data[0], default=str)}")
 
                     # Send the message over WebSocket connections
                     await send_message_to_connections(apigw_management_api, connection_ids, message)
-                    print(f"Sent message for sequence_id {sequence_id} to connections")
-                    sequence_id += 1
+                    print(f"Sent final message for sequence_id {sequence_id} to connections")
 
-                # After all data chunks have been sent, send a completion message
+                # Send completion message
                 completion_message = {
                     'type': 'completion',
                     'message': 'All data chunks have been sent.'
@@ -427,29 +326,12 @@ async def main_handler(event) -> Dict[str, Any]:
             'body': json.dumps({'message': 'Data sent successfully'})
         }
 
-    except OperationalError as e:
-        print(f"Operational error: {e}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': 'Database connection failed'})
-        }
-    except DatabaseError as e:
+    except asyncpg.PostgresError as e:
         print(f"Database error: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
         return {
             'statusCode': 500,
-            'body': json.dumps({'error': 'Database query failed'})
-        }
-    except SQLAlchemyError as e:
-        print(f"SQLAlchemy error: {e}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': 'An unexpected database error occurred'})
-        }
-    except ValueError as e:
-        print(f"Value error: {e}")
-        return {
-            'statusCode': 400,
-            'body': json.dumps({'error': str(e)})
+            'body': json.dumps({'error': f'Database error: {str(e)}'})
         }
     except Exception as e:
         print(f"Unexpected error during data streaming: {str(e)}")
@@ -460,10 +342,10 @@ async def main_handler(event) -> Dict[str, Any]:
             'body': json.dumps({'error': str(e)})
         }
     finally:
-        if engine:
-            print("Disposing of the database engine.")
-            await engine.dispose()
-            print("Database engine disposed.")
+        if conn:
+            print("Closing database connection.")
+            await conn.close()
+            print("Database connection closed.")
 
 
 async def remove_connection(connection_id: str):
