@@ -250,6 +250,10 @@ async def main_handler(event) -> Dict[str, Any]:
         )
         print("Database connection established.")
 
+        # Initialize variables for mean row size calculation
+        total_size = 0  # Total size of all rows in bytes
+        row_count = 0   # Number of rows processed
+
         # Create API Gateway management client
         session = aioboto3.Session()
         async with session.client('apigatewaymanagementapi', endpoint_url=endpoint) as apigw_management_api:
@@ -280,6 +284,17 @@ async def main_handler(event) -> Dict[str, Any]:
                                 row_dict[key] = str(value)
                             elif isinstance(value, bytes):
                                 row_dict[key] = value.decode('utf-8')
+
+                        # ------------------------------
+                        # Begin: Mean row size calculation
+                        # ------------------------------
+                        serialized_row = json.dumps(row_dict, default=str)
+                        row_size = len(serialized_row.encode('utf-8'))
+                        total_size += row_size
+                        row_count += 1
+                        # ------------------------------
+                        # End: Mean row size calculation
+                        # ------------------------------
 
                         chunk_data.append(row_dict)
 
@@ -348,6 +363,11 @@ async def main_handler(event) -> Dict[str, Any]:
                         await send_message_to_connections(apigw_management_api, connection_ids, message)
                         print(f"Sent final message for sequence_id {sequence_id}")
                         sequence_id += 1
+
+                # Compute and log the mean row size
+                if row_count > 0:
+                    mean_size = total_size / row_count
+                    print(f"Mean row size: {mean_size:.2f} bytes based on {row_count} rows.")
 
                 # Send completion message
                 completion_message = {
