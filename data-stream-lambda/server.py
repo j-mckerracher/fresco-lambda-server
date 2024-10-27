@@ -29,10 +29,10 @@ Required environment variables:
 - JWT_SECRET
 - JWT_ISSUER
 """
-ROW_LIMIT = 100000
+ROW_LIMIT = 1000
 
 # Updated: Set a default chunk size that is safe within the payload limit
-DEFAULT_CHUNK_SIZE = 100
+DEFAULT_CHUNK_SIZE = 50
 
 
 # Function to parse and validate the SQL query
