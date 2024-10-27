@@ -30,10 +30,11 @@ Required environment variables:
 - JWT_SECRET
 - JWT_ISSUER
 """
-ROW_LIMIT = 1000
+ROW_LIMIT = 1000000
 
 # Updated: Set a default chunk size that is safe within the payload limit
-DEFAULT_CHUNK_SIZE = 25
+DEFAULT_CHUNK_SIZE = 10
+
 
 # Function to parse and validate the SQL query
 def is_query_safe(query: str) -> bool:
@@ -95,7 +96,7 @@ def lambda_handler(event, context):
     finally:
         end_time = time.perf_counter()  # Record the end time
         elapsed_time = end_time - start_time
-        print(f"Lambda execution time: {elapsed_time:.6f} seconds")
+        print(f"Lambda execution time: {elapsed_time:.6f} seconds - chunk size = {DEFAULT_CHUNK_SIZE} row limit = {ROW_LIMIT}")
 
 
 async def main_handler(event) -> Dict[str, Any]:
