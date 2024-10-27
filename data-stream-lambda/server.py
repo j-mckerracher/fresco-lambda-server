@@ -3,6 +3,7 @@ import json
 import os
 import aioboto3
 import sqlparse
+import time  # Import the time module for timing
 from typing import List, Any, Dict
 from botocore.exceptions import ClientError
 from urllib.parse import unquote_plus
@@ -78,19 +79,24 @@ def is_query_safe(query: str) -> bool:
 
 # Main Lambda handler
 def lambda_handler(event, context):
-    print("Lambda handler invoked.")
-    print(f"Incoming event: {json.dumps(event)}")
-    request_context = event.get('requestContext', {})
+    start_time = time.perf_counter()  # Record the start time
+    try:
+        print("Lambda handler invoked.")
+        print(f"Incoming event: {json.dumps(event)}")
+        request_context = event.get('requestContext', {})
 
-    if 'http' in request_context:
-        print("Detected HTTP API event.")
-        return asyncio.run(main_handler(event))
-    else:
-        print("Invalid request to data Lambda: WebSocket event received.")
-        return {
-            'statusCode': 400,
-            'body': 'Invalid request'
-        }
+        if 'http' in request_context:
+            return asyncio.run(main_handler(event))
+        else:
+            print("Invalid request to data Lambda: WebSocket event received.")
+            return {
+                'statusCode': 400,
+                'body': 'Invalid request'
+            }
+    finally:
+        end_time = time.perf_counter()  # Record the end time
+        elapsed_time = end_time - start_time
+        print(f"Lambda execution time: {elapsed_time:.6f} seconds")
 
 
 async def main_handler(event) -> Dict[str, Any]:
@@ -223,7 +229,7 @@ async def main_handler(event) -> Dict[str, Any]:
             }
 
         # Configure chunk size
-        chunk_size = int(os.environ.get('CHUNK_SIZE', str(DEFAULT_CHUNK_SIZE)))  # Default to 250
+        chunk_size = int(os.environ.get('CHUNK_SIZE', str(DEFAULT_CHUNK_SIZE)))  # Default to 10
         print(f"Configured chunk size: {chunk_size}")
 
         # Initialize sequence_id
