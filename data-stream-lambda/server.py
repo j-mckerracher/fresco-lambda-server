@@ -32,7 +32,7 @@ Required environment variables:
 ROW_LIMIT = 1000
 
 # Updated: Set a default chunk size that is safe within the payload limit
-DEFAULT_CHUNK_SIZE = 50
+DEFAULT_CHUNK_SIZE = 25
 
 
 # Function to parse and validate the SQL query
