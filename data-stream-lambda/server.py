@@ -31,6 +31,9 @@ Required environment variables:
 """
 ROW_LIMIT = 100000
 
+# Updated: Set a default chunk size that is safe within the payload limit
+DEFAULT_CHUNK_SIZE = 250
+
 
 # Function to parse and validate the SQL query
 def is_query_safe(query: str) -> bool:
@@ -220,7 +223,7 @@ async def main_handler(event) -> Dict[str, Any]:
             }
 
         # Configure chunk size
-        chunk_size = int(os.environ.get('CHUNK_SIZE', '10000'))  # Default to 10,000
+        chunk_size = int(os.environ.get('CHUNK_SIZE', str(DEFAULT_CHUNK_SIZE)))  # Default to 250
         print(f"Configured chunk size: {chunk_size}")
 
         # Initialize sequence_id
@@ -281,14 +284,29 @@ async def main_handler(event) -> Dict[str, Any]:
                                 'data': chunk_data
                             }
 
-                            print(f"Prepared message for sequence_id {sequence_id} with {len(chunk_data)} rows")
-                            if chunk_data:
-                                print(f"Sample of first row in chunk: {json.dumps(chunk_data[0], default=str)}")
+                            # Serialize message to JSON
+                            serialized_message = json.dumps(message, default=str)
+                            message_size = len(serialized_message.encode('utf-8'))
+                            print(f"Serialized message size: {message_size} bytes")
 
-                            # Send the message over WebSocket connections
-                            await send_message_to_connections(apigw_management_api, connection_ids, message)
-                            print(f"Sent message for sequence_id {sequence_id} to connections")
-                            sequence_id += 1
+                            if message_size > 128 * 1024:
+                                print(f"Message size {message_size} exceeds the 128 KB limit. Splitting the message.")
+                                # Split chunk_data into smaller sub-chunks
+                                sub_chunks = split_large_chunk(chunk_data)
+                                for sub_chunk in sub_chunks:
+                                    sub_message = {
+                                        'sequence_id': sequence_id,
+                                        'data': sub_chunk
+                                    }
+                                    await send_message_to_connections(apigw_management_api, connection_ids, sub_message)
+                                    print(f"Sent sub-chunk for sequence_id {sequence_id}")
+                                    sequence_id += 1
+                            else:
+                                # Send the message as is
+                                await send_message_to_connections(apigw_management_api, connection_ids, message)
+                                print(f"Sent message for sequence_id {sequence_id}")
+                                sequence_id += 1
+
                             chunk_data = []  # Reset chunk data
 
                     except Exception as e:
@@ -303,13 +321,27 @@ async def main_handler(event) -> Dict[str, Any]:
                         'data': chunk_data
                     }
 
-                    print(f"Prepared final message for sequence_id {sequence_id} with {len(chunk_data)} rows")
-                    if chunk_data:
-                        print(f"Sample of first row in final chunk: {json.dumps(chunk_data[0], default=str)}")
+                    # Serialize message to JSON
+                    serialized_message = json.dumps(message, default=str)
+                    message_size = len(serialized_message.encode('utf-8'))
+                    print(f"Serialized message size: {message_size} bytes")
 
-                    # Send the message over WebSocket connections
-                    await send_message_to_connections(apigw_management_api, connection_ids, message)
-                    print(f"Sent final message for sequence_id {sequence_id} to connections")
+                    if message_size > 128 * 1024:
+                        print("Final message size exceeds 128 KB. Splitting into smaller sub-chunks.")
+                        sub_chunks = split_large_chunk(chunk_data)
+                        for sub_chunk in sub_chunks:
+                            sub_message = {
+                                'sequence_id': sequence_id,
+                                'data': sub_chunk
+                            }
+                            await send_message_to_connections(apigw_management_api, connection_ids, sub_message)
+                            print(f"Sent final sub-chunk for sequence_id {sequence_id}")
+                            sequence_id += 1
+                    else:
+                        # Send the final message as is
+                        await send_message_to_connections(apigw_management_api, connection_ids, message)
+                        print(f"Sent final message for sequence_id {sequence_id}")
+                        sequence_id += 1
 
                 # Send completion message
                 completion_message = {
@@ -374,7 +406,16 @@ async def send_message_to_connections(apigw_management_api, connection_ids: List
     Send a message to multiple WebSocket connections concurrently.
     Handle disconnections and failed sends.
     """
-    print(f"Sending message to {len(connection_ids)} connections.")
+    serialized_message = json.dumps(message, default=str)
+    message_size = len(serialized_message.encode('utf-8'))
+    print(f"Serialized message size: {message_size} bytes")
+
+    if message_size > 128 * 1024:
+        print(f"Cannot send message of size {message_size} bytes as it exceeds the 128 KB limit.")
+        # Optionally, implement further splitting or handle the error as needed
+        return
+
+    print(f"Sending message of size {message_size} bytes to {len(connection_ids)} connections.")
     tasks = []
     for connection_id in connection_ids:
         print(f"Preparing to send message to connection ID: {connection_id}")
@@ -446,3 +487,32 @@ async def get_client_connections(client_id: str) -> List[str]:
         connection_ids = [item['connectionId'] for item in items]
         print(f"Connection IDs: {connection_ids}")
         return connection_ids
+
+
+def split_large_chunk(chunk_data: List[Dict[str, Any]], max_size: int = 128 * 1024) -> List[List[Dict[str, Any]]]:
+    """
+    Splits chunk_data into smaller sub-chunks such that each sub-chunk's serialized size
+    does not exceed max_size bytes.
+    """
+    sub_chunks = []
+    current_sub_chunk = []
+    current_size = 0
+
+    for row in chunk_data:
+        serialized_row = json.dumps(row, default=str)
+        row_size = len(serialized_row.encode('utf-8'))
+
+        if current_size + row_size > max_size:
+            if current_sub_chunk:
+                sub_chunks.append(current_sub_chunk)
+            current_sub_chunk = [row]
+            current_size = row_size
+        else:
+            current_sub_chunk.append(row)
+            current_size += row_size
+
+    if current_sub_chunk:
+        sub_chunks.append(current_sub_chunk)
+
+    print(f"Split chunk into {len(sub_chunks)} sub-chunks to fit within {max_size} bytes.")
+    return sub_chunks
