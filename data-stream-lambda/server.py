@@ -1,12 +1,10 @@
 import asyncio
 import json
 import os
-import statistics
-
 import aioboto3
 import sqlparse
 import time
-from typing import List, Any, Dict, Optional, Tuple
+from typing import List, Any, Dict, Optional
 from botocore.exceptions import ClientError
 from urllib.parse import unquote_plus
 from sqlparse.tokens import Token
@@ -17,49 +15,13 @@ import uuid
 import asyncpg
 
 # Constants
-ROW_LIMIT = 10000
-DEFAULT_CHUNK_SIZE = 10
+ROW_LIMIT = 1000000
+DEFAULT_CHUNK_SIZE = 203
 DISALLOWED_SQL_KEYWORDS = {
     'INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE',
     'TRUNCATE', 'EXECUTE', 'GRANT', 'REVOKE', 'MERGE', 'CALL'
 }
 
-
-class RowSizeAnalyzer:
-    def __init__(self):
-        self.row_sizes = []
-        self.total_rows = 0
-        self.min_size = float('inf')
-        self.max_size = 0
-
-    def add_row_size(self, size: int):
-        self.row_sizes.append(size)
-        self.total_rows += 1
-        self.min_size = min(self.min_size, size)
-        self.max_size = max(self.max_size, size)
-
-    def get_statistics(self) -> Dict[str, Any]:
-        if not self.row_sizes:
-            return {
-                "error": "No rows analyzed"
-            }
-
-        return {
-            "total_rows": self.total_rows,
-            "min_size_bytes": self.min_size,
-            "max_size_bytes": self.max_size,
-            "mean_size_bytes": statistics.mean(self.row_sizes),
-            "median_size_bytes": statistics.median(self.row_sizes),
-            "stddev_size_bytes": statistics.stdev(self.row_sizes) if len(self.row_sizes) > 1 else 0,
-            "size_percentiles": {
-                "p25": statistics.quantiles(self.row_sizes, n=4)[0],
-                "p50": statistics.quantiles(self.row_sizes, n=4)[1],
-                "p75": statistics.quantiles(self.row_sizes, n=4)[2],
-                "p90": sorted(self.row_sizes)[int(len(self.row_sizes) * 0.9)],
-                "p95": sorted(self.row_sizes)[int(len(self.row_sizes) * 0.95)],
-                "p99": sorted(self.row_sizes)[int(len(self.row_sizes) * 0.99)]
-            }
-        }
 
 class SQLValidator:
     @staticmethod
@@ -204,8 +166,8 @@ class ConnectionManager:
 
 class DataProcessor:
     @staticmethod
-    def process_row(row: Dict[str, Any]) -> Tuple[Dict[str, Any], int]:  # Modified to return size
-        """Process a single row of data, handling special data types and return size."""
+    def process_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Process a single row of data, handling special data types."""
         processed_row = {}
         for key, value in row.items():
             if isinstance(value, (datetime.datetime, datetime.date)):
@@ -218,12 +180,7 @@ class DataProcessor:
                 processed_row[key] = value.decode('utf-8')
             else:
                 processed_row[key] = value
-
-        # Calculate row size
-        serialized_row = json.dumps(processed_row, default=str)
-        row_size = len(serialized_row.encode('utf-8'))
-
-        return processed_row, row_size
+        return processed_row
 
     @staticmethod
     def split_large_chunk(chunk_data: List[Dict[str, Any]], max_size: int = 128 * 1024) -> List[List[Dict[str, Any]]]:
@@ -257,8 +214,6 @@ class DataStreamHandler:
         self.connection_ids = connection_ids
         self.chunk_size = int(os.environ.get('CHUNK_SIZE', str(DEFAULT_CHUNK_SIZE)))
         self.sequence_id = 0
-        # Added: Initialize row size analyzer
-        self.row_size_analyzer = RowSizeAnalyzer()
 
     async def process_and_send_chunk(self, chunk_data: List[Dict[str, Any]]) -> None:
         """Process and send a chunk of data."""
@@ -285,24 +240,9 @@ class DataStreamHandler:
 
     async def send_completion_message(self) -> None:
         """Send completion message to all connections."""
-        # Added: Get and log row size statistics
-        stats = self.row_size_analyzer.get_statistics()
-        print("Row Size Statistics:")
-        print(json.dumps(stats, indent=2))
-
-        # Calculate recommended chunk size based on average row size
-        if stats.get("mean_size_bytes"):
-            mean_size = stats["mean_size_bytes"]
-            max_message_size = 128 * 1024  # 128 KB
-            recommended_chunk_size = max(1, int(max_message_size / (mean_size * 1.1)))  # 10% safety margin
-            print(f"Recommended chunk size: {recommended_chunk_size} rows")
-            print(
-                f"This would result in an average message size of: {mean_size * recommended_chunk_size / 1024:.2f} KB")
-
         completion_message = {
             'type': 'completion',
-            'message': 'All data chunks have been sent.',
-            'row_size_statistics': stats  # Added statistics to completion message
+            'message': 'All data chunks have been sent.'
         }
         await self.websocket_manager.send_message_to_connections(self.connection_ids, completion_message)
 
@@ -313,11 +253,7 @@ async def stream_data(conn: asyncpg.Connection, query: str, stream_handler: Data
 
     async with conn.transaction():
         async for record in conn.cursor(query, prefetch=stream_handler.chunk_size):
-            # Modified: Get row size along with processed row
-            row_dict, row_size = DataProcessor.process_row(dict(record))
-            # Added: Add row size to analyzer
-            stream_handler.row_size_analyzer.add_row_size(row_size)
-
+            row_dict = DataProcessor.process_row(dict(record))
             chunk_data.append(row_dict)
 
             if len(chunk_data) >= stream_handler.chunk_size:
