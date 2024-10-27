@@ -29,7 +29,7 @@ Required environment variables:
 - JWT_SECRET
 - JWT_ISSUER
 """
-ROW_LIMIT = 10
+ROW_LIMIT = 100000
 
 
 # Function to parse and validate the SQL query
