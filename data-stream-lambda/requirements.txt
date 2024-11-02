@@ -1,5 +1,7 @@
-sqlparse~=0.5.1
-boto3
-aioboto3~=13.2.0
-PyJWT~=2.9.0
-asyncpg
+# Core dependencies
+numpy<2.0.0  # Pin to numpy 1.x to avoid compatibility issues
+pyarrow>=12.0.1,<13.0.0  # Use a stable version compatible with numpy 1.x
+psycopg2-binary>=2.9.9  # Use binary distribution for easier installation
+sqlparse>=0.4.4
+boto3>=1.29.0
+botocore>=1.32.0

@@ -1,347 +1,293 @@
-import asyncio
 import json
 import os
-import aioboto3
+import psycopg2
+import psycopg2.pool
 import sqlparse
-import time
-from typing import List, Any, Dict, Optional
+import pyarrow as pa
+import pyarrow.ipc as ipc
+from psycopg2 import extras
+import boto3
 from botocore.exceptions import ClientError
-from urllib.parse import unquote_plus
-from sqlparse.tokens import Token
-import jwt
-import datetime
-import decimal
+import base64
+import time
 import uuid
-import asyncpg
 
 # Constants
-ROW_LIMIT = 1000000
-DEFAULT_CHUNK_SIZE = 203
-DISALLOWED_SQL_KEYWORDS = {
-    'INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE',
-    'TRUNCATE', 'EXECUTE', 'GRANT', 'REVOKE', 'MERGE', 'CALL'
-}
+MAX_MQTT_PAYLOAD_SIZE = 128 * 1024  # 128 KB
+CHUNK_SIZE = int((MAX_MQTT_PAYLOAD_SIZE - 200) * 0.75)  # AWS IoT MQTT payload limit
+ROW_LIMIT = 1000
 
+# Initialize the PostgreSQL connection pool as a global variable
+try:
+    db_pool = psycopg2.pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=20,  # Adjust based on expected concurrency and database limits
+        user=os.environ['DB_USER'],
+        password=os.environ['DB_PASSWORD'],
+        host=os.environ['DB_HOST'],
+        port=os.environ['DB_PORT'],
+        database=os.environ['DB_NAME']
+    )
+    print("Database connection pool created successfully.")
+except Exception as e:
+    print(f"Error creating database connection pool: {e}")
+    db_pool = None  # Handle this in the handler
 
-class SQLValidator:
-    @staticmethod
-    def is_query_safe(query: str) -> bool:
-        """Parse the SQL query and ensure it is a safe SELECT statement."""
-        print("Validating SQL query for safety.")
-        parsed = sqlparse.parse(query)
-        print(f"Parsed SQL statements count: {len(parsed)}")
-
-        if len(parsed) != 1:
-            print("Unsafe query: Multiple SQL statements detected.")
-            return False
-
-        stmt = parsed[0]
-        stmt_type = stmt.get_type()
-        print(f"SQL statement type: {stmt_type}")
-
-        if stmt_type != 'SELECT':
-            print("Unsafe query: Only SELECT statements are allowed.")
-            return False
-
-        for token in stmt.flatten():
-            if token.ttype == Token.Keyword and token.value.upper() in DISALLOWED_SQL_KEYWORDS:
-                print(f"Unsafe query: Disallowed keyword detected - {token.value}")
-                return False
-            if token.match(Token.Punctuation, ';'):
-                print("Unsafe query: Semicolon detected, which is not allowed.")
-                return False
-
-        print("SQL query is deemed safe.")
-        return True
-
-    @staticmethod
-    def add_limit_if_needed(query: str) -> str:
-        """Add LIMIT clause if not present in the query."""
-        parsed = sqlparse.parse(query)
-        stmt = parsed[0]
-        has_limit = any(
-            token.ttype == Token.Keyword and token.value.upper() == 'LIMIT'
-            for token in stmt.flatten()
-        )
-
-        if not has_limit:
-            return f"{query} LIMIT {ROW_LIMIT};"
-        return f"{query};"
-
-
-class AuthenticationHandler:
-    def __init__(self, event: Dict[str, Any]):
-        self.event = event
-        self.headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
-
-    def extract_token(self) -> Optional[str]:
-        """Extract JWT token from Authorization header."""
-        auth_header = self.headers.get('authorization')
-        if not auth_header:
-            raise ValueError("Authorization header missing")
-
-        try:
-            return auth_header.split(" ")[1]
-        except IndexError:
-            raise ValueError("Invalid Authorization header format")
-
-    def validate_token(self) -> str:
-        """Validate JWT token and return client_id."""
-        token = self.extract_token()
-        try:
-            decoded_token = jwt.decode(
-                token,
-                os.environ['JWT_SECRET'],
-                algorithms=['HS256'],
-                issuer=os.environ['JWT_ISSUER']
-            )
-            client_id = decoded_token.get('clientId')
-            if not client_id:
-                raise ValueError("clientId not found in token")
-            return client_id
-        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError) as e:
-            raise ValueError(f"Invalid token: {str(e)}")
-
-
-class WebSocketManager:
-    def __init__(self, apigw_management_api):
-        self.apigw_management_api = apigw_management_api
-
-    async def remove_connection(self, connection_id: str) -> None:
-        """Remove a connectionId from the DynamoDB table."""
-        print(f"Removing connection from DynamoDB: connectionId={connection_id}")
-        session = aioboto3.Session()
-        async with session.resource('dynamodb', region_name=os.environ['REGION']) as dynamodb:
-            table = await dynamodb.Table(os.environ['DYNAMODB_TABLE'])
-            await table.delete_item(Key={'connectionId': connection_id})
-            print(f"Connection {connection_id} removed from DynamoDB successfully.")
-
-    async def send_message_to_connections(self, connection_ids: List[str], message: Dict[str, Any]) -> None:
-        """Send a message to multiple WebSocket connections concurrently."""
-        serialized_message = json.dumps(message, default=str)
-        message_size = len(serialized_message.encode('utf-8'))
-
-        if message_size > 128 * 1024:
-            print(f"Cannot send message of size {message_size} bytes as it exceeds the 128 KB limit.")
-            return
-
-        print(f"Sending message to {len(connection_ids)} connections.")
-        tasks = [self.send_message(conn_id, message) for conn_id in connection_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for idx, result in enumerate(results):
-            if isinstance(result, Exception):
-                await self.remove_connection(connection_ids[idx])
-
-    async def send_message(self, connection_id: str, message: Dict[str, Any]) -> None:
-        """Send a single message to a WebSocket connection."""
-        try:
-            await self.apigw_management_api.post_to_connection(
-                Data=json.dumps(message, default=str).encode('utf-8'),
-                ConnectionId=connection_id
-            )
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            if error_code in ('GoneException', 'ForbiddenException'):
-                raise e
-            raise e
-        except Exception as e:
-            raise e
-
-
-class ConnectionManager:
-    @staticmethod
-    async def get_client_connections(client_id: str) -> List[str]:
-        """Retrieve all active connectionIds for a client."""
-        session = aioboto3.Session()
-        async with session.resource('dynamodb', region_name=os.environ['REGION']) as dynamodb:
-            table = await dynamodb.Table(os.environ['DYNAMODB_TABLE'])
-            response = await table.query(
-                IndexName='ClientIdIndex',
-                KeyConditionExpression='clientId = :cid',
-                ExpressionAttributeValues={':cid': client_id}
-            )
-            return [item['connectionId'] for item in response.get('Items', [])]
-
-
-class DataProcessor:
-    @staticmethod
-    def process_row(row: Dict[str, Any]) -> Dict[str, Any]:
-        """Process a single row of data, handling special data types."""
-        processed_row = {}
-        for key, value in row.items():
-            if isinstance(value, (datetime.datetime, datetime.date)):
-                processed_row[key] = value.isoformat()
-            elif isinstance(value, decimal.Decimal):
-                processed_row[key] = float(value)
-            elif isinstance(value, uuid.UUID):
-                processed_row[key] = str(value)
-            elif isinstance(value, bytes):
-                processed_row[key] = value.decode('utf-8')
-            else:
-                processed_row[key] = value
-        return processed_row
-
-    @staticmethod
-    def split_large_chunk(chunk_data: List[Dict[str, Any]], max_size: int = 128 * 1024) -> List[List[Dict[str, Any]]]:
-        """Split chunk_data into smaller sub-chunks."""
-        sub_chunks = []
-        current_sub_chunk = []
-        current_size = 0
-
-        for row in chunk_data:
-            serialized_row = json.dumps(row, default=str)
-            row_size = len(serialized_row.encode('utf-8'))
-
-            if current_size + row_size > max_size:
-                if current_sub_chunk:
-                    sub_chunks.append(current_sub_chunk)
-                current_sub_chunk = [row]
-                current_size = row_size
-            else:
-                current_sub_chunk.append(row)
-                current_size += row_size
-
-        if current_sub_chunk:
-            sub_chunks.append(current_sub_chunk)
-
-        return sub_chunks
-
-
-class DataStreamHandler:
-    def __init__(self, websocket_manager: WebSocketManager, connection_ids: List[str]):
-        self.websocket_manager = websocket_manager
-        self.connection_ids = connection_ids
-        self.chunk_size = int(os.environ.get('CHUNK_SIZE', str(DEFAULT_CHUNK_SIZE)))
-        self.sequence_id = 0
-
-    async def process_and_send_chunk(self, chunk_data: List[Dict[str, Any]]) -> None:
-        """Process and send a chunk of data."""
-        message = {
-            'sequence_id': self.sequence_id,
-            'data': chunk_data
-        }
-
-        serialized_message = json.dumps(message, default=str)
-        message_size = len(serialized_message.encode('utf-8'))
-
-        if message_size > 128 * 1024:
-            sub_chunks = DataProcessor.split_large_chunk(chunk_data)
-            for sub_chunk in sub_chunks:
-                sub_message = {
-                    'sequence_id': self.sequence_id,
-                    'data': sub_chunk
-                }
-                await self.websocket_manager.send_message_to_connections(self.connection_ids, sub_message)
-                self.sequence_id += 1
-        else:
-            await self.websocket_manager.send_message_to_connections(self.connection_ids, message)
-            self.sequence_id += 1
-
-    async def send_completion_message(self) -> None:
-        """Send completion message to all connections."""
-        completion_message = {
-            'type': 'completion',
-            'message': 'All data chunks have been sent.'
-        }
-        await self.websocket_manager.send_message_to_connections(self.connection_ids, completion_message)
-
-
-async def stream_data(conn: asyncpg.Connection, query: str, stream_handler: DataStreamHandler) -> None:
-    """Stream data from database and send to WebSocket connections."""
-    chunk_data = []
-
-    async with conn.transaction():
-        async for record in conn.cursor(query, prefetch=stream_handler.chunk_size):
-            row_dict = DataProcessor.process_row(dict(record))
-            chunk_data.append(row_dict)
-
-            if len(chunk_data) >= stream_handler.chunk_size:
-                await stream_handler.process_and_send_chunk(chunk_data)
-                chunk_data = []
-
-        if chunk_data:
-            await stream_handler.process_and_send_chunk(chunk_data)
-
-        await stream_handler.send_completion_message()
-
-
-async def main_handler(event: Dict[str, Any]) -> Dict[str, Any]:
-    """Main handler for processing incoming requests."""
-    conn = None
-    try:
-        # Validate request
-        route_key = event.get('routeKey', '')
-        try:
-            http_method, path = route_key.split(' ', 1)
-        except ValueError:
-            return {'statusCode': 400, 'body': json.dumps({'error': 'Bad Request'})}
-
-        if http_method.upper() != 'GET' or path != '/data':
-            return {'statusCode': 405, 'body': json.dumps({'error': 'Method Not Allowed'})}
-
-        # Authenticate request
-        auth_handler = AuthenticationHandler(event)
-        try:
-            client_id = auth_handler.validate_token()
-        except ValueError as e:
-            return {'statusCode': 401, 'body': json.dumps({'error': f'Unauthorized: {str(e)}'})}
-
-        # Get and validate query
-        query_param = event.get('queryStringParameters', {}).get('query')
-        if not query_param:
-            return {'statusCode': 400, 'body': json.dumps({'error': 'Missing query parameter'})}
-
-        query = unquote_plus(query_param)
-        if not SQLValidator.is_query_safe(query):
-            return {'statusCode': 400, 'body': json.dumps({'error': 'Unsafe query'})}
-
-        query_with_limit = SQLValidator.add_limit_if_needed(query)
-
-        # Get active connections
-        connection_ids = await ConnectionManager.get_client_connections(client_id)
-        if not connection_ids:
-            return {'statusCode': 400, 'body': json.dumps({'error': 'No active WebSocket connections for client'})}
-
-        # Set up API Gateway management
-        endpoint = f"https://{os.environ['WEBSOCKET_API_ID']}.execute-api.{os.environ['REGION']}.amazonaws.com/{os.environ['WEBSOCKET_STAGE']}"
-        session = aioboto3.Session()
-
-        # Initialize database connection
-        conn = await asyncpg.connect(
-            user=os.environ['DB_USER'],
-            password=os.environ['DB_PASSWORD'],
-            host=os.environ['DB_HOST'],
-            port=os.environ['DB_PORT'],
-            database=os.environ['DB_NAME']
-        )
-
-        # Stream data
-        async with session.client('apigatewaymanagementapi', endpoint_url=endpoint) as apigw_management_api:
-            websocket_manager = WebSocketManager(apigw_management_api)
-            stream_handler = DataStreamHandler(websocket_manager, connection_ids)
-            await stream_data(conn, query_with_limit, stream_handler)
-
-        return {'statusCode': 200, 'body': json.dumps({'message': 'Data sent successfully'})}
-
-    except asyncpg.PostgresError as e:
-        print(f"Database error: {e}")
-        return {'statusCode': 500, 'body': json.dumps({'error': f'Database error: {str(e)}'})}
-    except Exception as e:
-        print(f"Unexpected error: {str(e)}")
-        return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
-    finally:
-        if conn:
-            await conn.close()
+# Initialize AWS IoT Data client using boto3
+try:
+    iot_endpoint = os.environ['IOT_ENDPOINT']
+    iot_topic = os.environ['IOT_TOPIC']
+    region = os.environ.get('REGION', 'us-east-1')
+    iot_client = boto3.client('iot-data', region_name=region, endpoint_url=f"https://{iot_endpoint}")
+    print("AWS IoT Data client initialized successfully.")
+except Exception as e:
+    print(f"Error initializing AWS IoT Data client: {e}")
+    iot_client = None  # Handle this in the handler
 
 
 def lambda_handler(event, context):
-    start_time = time.perf_counter()
+    """
+    Lambda function handler to process GraphQL queries, execute SQL against PostgreSQL,
+    serialize the results to Apache Arrow IPC format, publish the data in chunks to AWS IoT,
+    and return metadata about the published data.
+    """
+    print("Received event:", json.dumps(event))
+
     try:
-        request_context = event.get('requestContext', {})
-        if 'http' in request_context:
-            return asyncio.run(main_handler(event))
-        return {'statusCode': 400, 'body': 'Invalid request'}
+        # Extract the SQL query from the AppSync event arguments
+        query = event['arguments']['query']
+        print(f"Extracted query: {query}")
+    except KeyError:
+        print("No query provided in the arguments.")
+        return {
+            'error': 'No query provided.'
+        }
+
+    # Validate the SQL query
+    if not is_query_safe(query):
+        print("Unsafe SQL query detected.")
+        return {
+            'error': 'Unsafe SQL query.'
+        }
+
+    # Add LIMIT clause if needed
+    query_with_limit = add_limit_if_needed(query)
+    print(f"Final query to execute: {query_with_limit}")
+
+    # Connect to the database using the connection pool
+    if db_pool is None:
+        print("Database connection pool is not initialized.")
+        return {
+            'error': 'Database connection pool is not initialized.'
+        }
+
+    try:
+        conn = db_pool.getconn()
+        print("Acquired database connection from pool.")
+    except Exception as e:
+        print(f"Error acquiring database connection: {e}")
+        return {
+            'error': 'Failed to acquire database connection.'
+        }
+
+    try:
+        arrow_data, row_count, schema_info = execute_query_and_serialize(conn, query_with_limit)
+    except Exception as e:
+        print(f"Query execution failed: {e}")
+        return {
+            'error': 'Query execution failed.'
+        }
     finally:
-        end_time = time.perf_counter()
-        print(f"Lambda execution time: {end_time - start_time:.6f} seconds")
+        # Release the connection back to the pool
+        db_pool.putconn(conn)
+        print("Released database connection back to pool.")
+
+    if not arrow_data:
+        print("No data returned from query.")
+        return {
+            'error': 'No data returned from query.'
+        }
+
+    # Generate a unique reference ID for this data transfer
+    transfer_id = str(uuid.uuid4())
+
+    # Publish the binary data to AWS IoT MQTT topic in chunks
+    if iot_client is None or iot_topic is None:
+        print("AWS IoT Data client is not initialized.")
+        return {
+            'error': 'AWS IoT Data client is not initialized.'
+        }
+
+    try:
+        chunk_info = publish_in_chunks(iot_client, iot_topic, arrow_data, transfer_id)
+        print(f"Published data to IoT topic '{iot_topic}' in chunks.")
+    except Exception as e:
+        print(f"Failed to publish data in chunks: {e}")
+        return {
+            'error': 'Failed to publish data to IoT topic.'
+        }
+
+    # Return metadata about the published data
+    return {
+        'status': 'success',
+    }
+
+
+def is_query_safe(query):
+    """
+    Validates the SQL query for safety by checking for disallowed keywords and semicolons.
+    Returns True if the query is considered safe, False otherwise.
+    """
+    print("Validating SQL query for safety.")
+    disallowed_keywords = [
+        'INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE',
+        'TRUNCATE', 'EXECUTE', 'GRANT', 'REVOKE', 'REPLACE'
+    ]
+    parsed = sqlparse.parse(query)
+    if not parsed:
+        print("Failed to parse SQL query.")
+        return False
+
+    tokens = [token for token in parsed[0].flatten()]
+    token_values = [token.value.upper() for token in tokens if not token.is_whitespace]
+
+    for keyword in disallowed_keywords:
+        if keyword.upper() in token_values:
+            print(f"Disallowed keyword '{keyword}' found in query.")
+            return False
+
+    if ';' in query:
+        print("Semicolon detected in query.")
+        return False
+
+    print("SQL query is considered safe.")
+    return True
+
+
+def add_limit_if_needed(query, row_limit=ROW_LIMIT):
+    """
+    Appends a LIMIT clause to the SQL query if it's not already present.
+    """
+    print("Adding LIMIT clause if needed.")
+    if 'LIMIT' not in query.upper():
+        limited_query = f"{query} LIMIT {row_limit}"
+        print(f"LIMIT added to query: {limited_query}")
+        return limited_query
+    else:
+        print("Query already contains LIMIT.")
+        return query
+
+
+def execute_query_and_serialize(conn, query):
+    """
+    Executes the SQL query, fetches the data, converts it to Apache Arrow IPC format,
+    and returns the binary data along with row count and schema information.
+    """
+    print(f"Executing query: {query}")
+    with conn.cursor(cursor_factory=extras.RealDictCursor) as cursor:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        row_count = len(rows)
+        print(f"Query returned {row_count} rows.")
+
+        if rows:
+            # Convert list of dicts to PyArrow Table
+            table = pa.Table.from_pylist(rows)
+            print("Converted rows to PyArrow Table.")
+
+            # Extract schema information
+            schema_info = {
+                field.name: str(field.type)
+                for field in table.schema
+            }
+
+            # Serialize the table to Apache Arrow IPC format
+            sink = pa.BufferOutputStream()
+            writer = ipc.RecordBatchStreamWriter(sink, table.schema)
+            writer.write_table(table)
+            writer.close()
+            arrow_data = sink.getvalue().to_pybytes()
+            print("Serialized data to Apache Arrow IPC format.")
+            return arrow_data, row_count, schema_info
+        else:
+            print("No data to serialize.")
+            return b'', 0, {}
+
+
+def publish_in_chunks(iot_client, topic, data, transfer_id):
+    """
+    Publishes the given data to the specified IoT topic in chunks,
+    accounting for Base64 encoding overhead and metadata size.
+    """
+    total_size = len(data)
+    print(f"Total data size: {total_size} bytes.")
+    chunk_count = 0
+    total_chunks = -(-total_size // CHUNK_SIZE)  # Ceiling division
+
+    for i in range(0, total_size, CHUNK_SIZE):
+        chunk = data[i:i + CHUNK_SIZE]
+        chunk_size = len(chunk)
+        chunk_count += 1
+
+        # Create chunk metadata
+        chunk_metadata = {
+            'transfer_id': transfer_id,
+            'chunk_number': chunk_count,
+            'total_chunks': total_chunks,
+            'chunk_size': chunk_size
+        }
+
+        # Encode the chunk
+        encoded_chunk = base64.b64encode(chunk).decode('utf-8')
+
+        # Create the full payload
+        payload = {
+            'metadata': chunk_metadata,
+            'data': encoded_chunk
+        }
+
+        # Verify payload size before sending
+        payload_json = json.dumps(payload)
+        payload_size = len(payload_json.encode('utf-8'))
+        print(f"Publishing chunk {chunk_count}/{total_chunks}: {payload_size} bytes (after encoding)")
+
+        if payload_size > MAX_MQTT_PAYLOAD_SIZE:
+            print(f"Warning: Payload size {payload_size} exceeds MQTT limit of {MAX_MQTT_PAYLOAD_SIZE}")
+            raise Exception(f"Payload size {payload_size} exceeds MQTT limit")
+
+        try:
+            iot_client.publish(
+                topic=topic,
+                qos=1,
+                payload=payload_json
+            )
+            print(f"Successfully published chunk {chunk_count}/{total_chunks}.")
+        except ClientError as e:
+            print(f"ClientError publishing chunk {chunk_count}: {e}")
+            retries = 3
+            delay = 1
+            for attempt in range(1, retries + 1):
+                try:
+                    print(f"Retrying chunk {chunk_count}, attempt {attempt}.")
+                    time.sleep(delay)
+                    iot_client.publish(
+                        topic=topic,
+                        qos=1,
+                        payload=payload_json
+                    )
+                    print(f"Successfully published chunk {chunk_count} on retry {attempt}.")
+                    break
+                except ClientError as retry_e:
+                    print(f"Retry {attempt} failed for chunk {chunk_count}: {retry_e}")
+                    delay *= 2
+                    if attempt == retries:
+                        raise Exception(f"Failed to publish chunk {chunk_count} after {retries} attempts.")
+        except Exception as e:
+            print(f"Unexpected error publishing chunk {chunk_count}: {e}")
+            raise Exception(f"Failed to publish chunk {chunk_count}: {e}")
+
+    print(f"All {chunk_count} chunks published successfully.")
+    return {
+        'chunk_count': chunk_count,
+        'total_chunks': total_chunks
+    }
