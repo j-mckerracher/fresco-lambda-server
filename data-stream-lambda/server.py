@@ -1,16 +1,14 @@
 import json
 import os
-import psycopg2
 import psycopg2.pool
 import sqlparse
 import pyarrow as pa
 import pyarrow.ipc as ipc
 from psycopg2 import extras
 import boto3
-from botocore.exceptions import ClientError
 import base64
-import time
 import uuid
+from operator import itemgetter
 
 # Constants
 MAX_MQTT_PAYLOAD_SIZE = 128 * 1024  # 128 KB
@@ -110,6 +108,7 @@ def lambda_handler(event, context):
 
     # Generate a unique reference ID for this data transfer
     transfer_id = str(uuid.uuid4())
+    print(f"Generated Transfer ID: {transfer_id}")
 
     # Publish the binary data to AWS IoT MQTT topic in chunks
     if iot_client is None or iot_topic is None:
@@ -120,16 +119,16 @@ def lambda_handler(event, context):
 
     try:
         chunk_info = publish_in_chunks(iot_client, iot_topic, arrow_data, transfer_id)
-        print(f"Published data to IoT topic '{iot_topic}' in chunks.")
+        print(f"Published data to IoT topic '{iot_topic}' in {chunk_info['chunk_count']} chunks.")
     except Exception as e:
         print(f"Failed to publish data in chunks: {e}")
         return {
             'error': 'Failed to publish data to IoT topic.'
         }
 
-    # Return metadata about the published data
+    # Return the transferId as per Option 2
     return {
-        'status': 'success',
+        'transferId': transfer_id
     }
 
 
@@ -200,6 +199,7 @@ def execute_query_and_serialize(conn, query):
                 field.name: str(field.type)
                 for field in table.schema
             }
+            print(f"Schema Information: {schema_info}")
 
             # Serialize the table to Apache Arrow IPC format
             sink = pa.BufferOutputStream()
@@ -217,76 +217,58 @@ def execute_query_and_serialize(conn, query):
 def publish_in_chunks(iot_client, topic, data, transfer_id):
     """
     Publishes the given data to the specified IoT topic in chunks,
-    accounting for Base64 encoding overhead and metadata size.
+    ensuring strict ordering with sequence numbers.
     """
     total_size = len(data)
     print(f"Total data size: {total_size} bytes.")
     chunk_count = 0
     total_chunks = -(-total_size // CHUNK_SIZE)  # Ceiling division
 
+    chunks_published = []  # Track published chunks for ordering verification
+
     for i in range(0, total_size, CHUNK_SIZE):
         chunk = data[i:i + CHUNK_SIZE]
         chunk_size = len(chunk)
         chunk_count += 1
+        sequence_number = chunk_count  # Explicit sequence number for ordering
 
-        # Create chunk metadata
-        chunk_metadata = {
-            'transfer_id': transfer_id,
-            'chunk_number': chunk_count,
-            'total_chunks': total_chunks,
-            'chunk_size': chunk_size
+        # Create message structure
+        message = {
+            'type': 'arrow_data',  # Add a type indicator
+            'metadata': {
+                'transfer_id': transfer_id,
+                'sequence_number': sequence_number,
+                'total_chunks': total_chunks,
+                'chunk_size': chunk_size,
+                'format': 'arrow_ipc'  # Indicate the data format
+            },
+            'data': base64.b64encode(chunk).decode('utf-8')
         }
 
-        # Encode the chunk
-        encoded_chunk = base64.b64encode(chunk).decode('utf-8')
-
-        # Create the full payload
-        payload = {
-            'metadata': chunk_metadata,
-            'data': encoded_chunk
-        }
-
-        # Verify payload size before sending
-        payload_json = json.dumps(payload)
+        payload_json = json.dumps(message)
         payload_size = len(payload_json.encode('utf-8'))
-        print(f"Publishing chunk {chunk_count}/{total_chunks}: {payload_size} bytes (after encoding)")
 
         if payload_size > MAX_MQTT_PAYLOAD_SIZE:
-            print(f"Warning: Payload size {payload_size} exceeds MQTT limit of {MAX_MQTT_PAYLOAD_SIZE}")
             raise Exception(f"Payload size {payload_size} exceeds MQTT limit")
 
+        chunks_published.append({
+            'sequence_number': sequence_number,
+            'payload': payload_json
+        })
+
+    # Publish chunks in strict sequence order
+    for chunk in sorted(chunks_published, key=itemgetter('sequence_number')):
         try:
             iot_client.publish(
                 topic=topic,
-                qos=1,
-                payload=payload_json
+                qos=1,  # Using QoS 1 for at-least-once delivery
+                payload=chunk['payload']
             )
-            print(f"Successfully published chunk {chunk_count}/{total_chunks}.")
-        except ClientError as e:
-            print(f"ClientError publishing chunk {chunk_count}: {e}")
-            retries = 3
-            delay = 1
-            for attempt in range(1, retries + 1):
-                try:
-                    print(f"Retrying chunk {chunk_count}, attempt {attempt}.")
-                    time.sleep(delay)
-                    iot_client.publish(
-                        topic=topic,
-                        qos=1,
-                        payload=payload_json
-                    )
-                    print(f"Successfully published chunk {chunk_count} on retry {attempt}.")
-                    break
-                except ClientError as retry_e:
-                    print(f"Retry {attempt} failed for chunk {chunk_count}: {retry_e}")
-                    delay *= 2
-                    if attempt == retries:
-                        raise Exception(f"Failed to publish chunk {chunk_count} after {retries} attempts.")
+            print(f"Published chunk {chunk['sequence_number']}/{total_chunks}")
         except Exception as e:
-            print(f"Unexpected error publishing chunk {chunk_count}: {e}")
-            raise Exception(f"Failed to publish chunk {chunk_count}: {e}")
+            print(f"Error publishing chunk {chunk['sequence_number']}: {e}")
+            raise
 
-    print(f"All {chunk_count} chunks published successfully.")
     return {
         'chunk_count': chunk_count,
         'total_chunks': total_chunks
