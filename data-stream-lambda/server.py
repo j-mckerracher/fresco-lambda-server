@@ -95,17 +95,20 @@ def chunk_arrow_data(data: bytes, max_chunk_size: int) -> List[bytes]:
 
 
 def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
-                  transfer_id: str, sequence_number: int, max_chunk_size: int = MAX_DATA_SIZE) -> None:
+                  transfer_id: str, sequence_number: int, is_final_batch: bool = False,
+                  max_chunk_size: int = MAX_DATA_SIZE) -> None:
     """
     Publish Arrow Stream IPC data, splitting into chunks if necessary.
     """
-    # Split the batch_data into chunks if it exceeds max_chunk_size
     chunks = chunk_arrow_data(batch_data, max_chunk_size)
     total_chunks = len(chunks)
 
-    print(f"Publishing {total_chunks} chunks for sequence {sequence_number} to topic {topic}.")
+    print(f"Publishing {total_chunks} chunks for sequence {sequence_number} to topic {topic}. Is final batch: {is_final_batch}")
 
     for chunk_number, chunk_data in enumerate(chunks, start=1):
+        # Determine if this is the final message - only true for the last chunk of the final batch
+        is_final = is_final_batch and (chunk_number == total_chunks)
+
         message = {
             'type': 'arrow_data',
             'metadata': {
@@ -116,7 +119,7 @@ def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
                 'chunk_size': len(chunk_data),
                 'format': 'arrow_stream_ipc',
                 'timestamp': int(time.time() * 1000),
-                'is_final_sequence': (sequence_number == 1 and chunk_number == total_chunks)  # Added flag
+                'is_final_sequence': is_final
             },
             'data': base64.b64encode(chunk_data).decode('utf-8')
         }
@@ -140,8 +143,12 @@ def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
                 qos=1,
                 payload=json.dumps(message)
             )
-            print(f"Published sequence {sequence_number}, chunk {chunk_number}/{total_chunks}")
+            print(f"Published sequence {sequence_number}, chunk {chunk_number}/{total_chunks} (is_final_sequence: {is_final})")
             print(f"IoT publish response: {json.dumps(response, default=str)}")
+
+            if is_final:
+                print(f"Published final message for transfer {transfer_id}")
+
         except Exception as e:
             print(f"Error publishing chunk {chunk_number}: {str(e)}")
             raise
@@ -163,7 +170,14 @@ def lambda_handler(event, context):
     try:
         # Extract parameters from the event
         query = event['arguments']['query']
-        transfer_id = event['arguments'].get('transferId', str(uuid.uuid4()))
+        transfer_id = event['arguments'].get('transferId')
+
+        if not transfer_id:
+            print("No transfer ID provided, generating new one")
+            transfer_id = str(uuid.uuid4())
+
+        print(f"Using transfer ID: {transfer_id}")
+
         row_limit = event['arguments'].get('rowLimit', DEFAULT_ROW_LIMIT)
         batch_size = event['arguments'].get('batchSize', DEFAULT_BATCH_SIZE)
 
@@ -215,18 +229,24 @@ def lambda_handler(event, context):
         print(f"Determined schema: {json.dumps(schema_info)}")
 
         sequence_number = 1
-        row_count = 0
+        row_count = len(first_batch)
 
         print(f"Starting to process and publish rows for transfer ID: {transfer_id}")
 
-        # Process and publish the first batch
-        row_count += len(first_batch)
-        print(f"Processing batch {sequence_number} with {len(first_batch)} rows.")
+        # Process first batch
         batch_data = process_rows(first_batch, schema)
-        publish_batch(iot_client, iot_topic, batch_data, transfer_id, sequence_number)
 
-        # If there's only one batch, we're done
-        if len(first_batch) < batch_size:
+        # Check if this is the only batch we'll have
+        peek_next = cursor.fetchone()
+        is_final = peek_next is None or row_count >= row_limit
+        if peek_next:
+            cursor.scroll(-1)  # Move cursor back if we peeked a row
+
+        # Publish first batch with correct final flag
+        print(f"Publishing first batch. Is final: {is_final}")
+        publish_batch(iot_client, iot_topic, batch_data, transfer_id, sequence_number, is_final_batch=is_final)
+
+        if is_final:
             print("Query complete - only one batch needed.")
             return {
                 'transferId': transfer_id,
@@ -237,16 +257,22 @@ def lambda_handler(event, context):
                 }
             }
 
-        # Process and publish remaining batches
-        sequence_number += 1
-        for batch_rows in stream_query_results(cursor, batch_size):
-            row_count += len(batch_rows)
-            print(f"Processing batch {sequence_number} with {len(batch_rows)} rows.")
-            batch_data = process_rows(batch_rows, schema)
-            publish_batch(iot_client, iot_topic, batch_data, transfer_id, sequence_number)
-            sequence_number += 1
+        # Fetch and process remaining batches
+        remaining_batches = list(stream_query_results(cursor, batch_size))
+        total_batches = len(remaining_batches)
 
-            # Break if we've hit the row limit
+        for i, batch_rows in enumerate(remaining_batches):
+            sequence_number += 1
+            batch_row_count = len(batch_rows)
+            row_count += batch_row_count
+
+            print(f"Processing batch {sequence_number} with {batch_row_count} rows.")
+            batch_data = process_rows(batch_rows, schema)
+
+            # Check if this is the final batch
+            is_final = (i == total_batches - 1) or (row_count >= row_limit)
+            publish_batch(iot_client, iot_topic, batch_data, transfer_id, sequence_number, is_final_batch=is_final)
+
             if row_count >= row_limit:
                 print(f"Row limit {row_limit} reached. Stopping query execution.")
                 break
@@ -257,7 +283,7 @@ def lambda_handler(event, context):
             'transferId': transfer_id,
             'metadata': {
                 'rowCount': row_count,
-                'chunkCount': sequence_number - 1,
+                'chunkCount': sequence_number,
                 'schema': schema_info
             }
         }
