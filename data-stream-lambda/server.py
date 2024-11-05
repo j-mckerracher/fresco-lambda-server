@@ -45,9 +45,7 @@ except Exception as e:
 
 def lambda_handler(event, context):
     """
-    Lambda function handler to process GraphQL queries, execute SQL against PostgreSQL,
-    serialize the results to Apache Arrow IPC format, publish the data in chunks to AWS IoT,
-    and return metadata about the published data.
+    Lambda function handler that conforms to the existing GraphQL schema
     """
     print("Received event:", json.dumps(event))
 
@@ -57,16 +55,12 @@ def lambda_handler(event, context):
         print(f"Extracted query: {query}")
     except KeyError:
         print("No query provided in the arguments.")
-        return {
-            'error': 'No query provided.'
-        }
+        raise Exception('No query provided.')
 
     # Validate the SQL query
     if not is_query_safe(query):
         print("Unsafe SQL query detected.")
-        return {
-            'error': 'Unsafe SQL query.'
-        }
+        raise Exception('Unsafe SQL query.')
 
     # Add LIMIT clause if needed
     query_with_limit = add_limit_if_needed(query)
@@ -75,26 +69,20 @@ def lambda_handler(event, context):
     # Connect to the database using the connection pool
     if db_pool is None:
         print("Database connection pool is not initialized.")
-        return {
-            'error': 'Database connection pool is not initialized.'
-        }
+        raise Exception('Database connection pool is not initialized.')
 
     try:
         conn = db_pool.getconn()
         print("Acquired database connection from pool.")
     except Exception as e:
         print(f"Error acquiring database connection: {e}")
-        return {
-            'error': 'Failed to acquire database connection.'
-        }
+        raise Exception('Failed to acquire database connection.')
 
     try:
         arrow_data, row_count, schema_info = execute_query_and_serialize(conn, query_with_limit)
     except Exception as e:
         print(f"Query execution failed: {e}")
-        return {
-            'error': 'Query execution failed.'
-        }
+        raise Exception('Query execution failed.')
     finally:
         # Release the connection back to the pool
         db_pool.putconn(conn)
@@ -102,33 +90,30 @@ def lambda_handler(event, context):
 
     if not arrow_data:
         print("No data returned from query.")
-        return {
-            'error': 'No data returned from query.'
-        }
+        raise Exception('No data returned from query.')
 
     # Generate a unique reference ID for this data transfer
     transfer_id = str(uuid.uuid4())
     print(f"Generated Transfer ID: {transfer_id}")
 
-    # Publish the binary data to AWS IoT MQTT topic in chunks
-    if iot_client is None or iot_topic is None:
-        print("AWS IoT Data client is not initialized.")
-        return {
-            'error': 'AWS IoT Data client is not initialized.'
-        }
+    # Calculate total chunks
+    total_chunks = -(-len(arrow_data) // CHUNK_SIZE)  # Ceiling division
 
     try:
         chunk_info = publish_in_chunks(iot_client, iot_topic, arrow_data, transfer_id)
         print(f"Published data to IoT topic '{iot_topic}' in {chunk_info['chunk_count']} chunks.")
     except Exception as e:
         print(f"Failed to publish data in chunks: {e}")
-        return {
-            'error': 'Failed to publish data to IoT topic.'
-        }
+        raise Exception('Failed to publish data to IoT topic.')
 
-    # Return the transferId as per Option 2
+    # Return structure matching the GraphQL schema
     return {
-        'transferId': transfer_id
+        'transferId': transfer_id,
+        'metadata': {
+            'rowCount': row_count,
+            'chunkCount': total_chunks,
+            'schema': schema_info
+        }
     }
 
 
