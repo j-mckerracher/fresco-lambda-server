@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import psycopg2.pool
 import sqlparse
@@ -8,15 +9,15 @@ from psycopg2 import extras
 import boto3
 import base64
 import uuid
-from typing import Iterator, Dict, Any
+from typing import Iterator, Dict, Any, List
 import time
-import math
+import io
 
 # Constants
 MAX_MQTT_PAYLOAD_SIZE = 128 * 1024  # 128 KB
 MAX_DATA_SIZE = int(MAX_MQTT_PAYLOAD_SIZE * 0.7)  # Leave room for metadata and base64 encoding
-BATCH_SIZE = 1000  # Number of rows to process at once
-ROW_LIMIT = 1000
+BATCH_SIZE = 500  # Reduced batch size for better chunking
+ROW_LIMIT = 100
 
 # Initialize the PostgreSQL connection pool
 try:
@@ -69,26 +70,72 @@ def create_record_batch(rows: list, schema: pa.Schema) -> pa.RecordBatch:
     return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
-def chunk_data(data: bytes, max_chunk_size: int) -> list:
+def serialize_arrow_batch(record_batch: pa.RecordBatch) -> bytes:
     """
-    Split data into chunks that will fit within MQTT payload limits after base64 encoding
+    Serialize a single record batch to bytes using Arrow IPC format.
     """
-    # Calculate base64 encoded size
-    encoded_size = math.ceil(len(data) * 4 / 3)
-    num_chunks = math.ceil(encoded_size / max_chunk_size)
-    chunk_size = math.ceil(len(data) / num_chunks)
+    sink = pa.BufferOutputStream()
+    writer = ipc.new_file(sink, record_batch.schema)
+    writer.write_batch(record_batch)
+    writer.close()
+    return sink.getvalue().to_pybytes()
 
-    return [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
+
+def chunk_arrow_data(data: bytes, max_chunk_size: int) -> List[bytes]:
+    """
+    Split Arrow data into chunks while preserving Arrow IPC format.
+    """
+    if len(data) <= max_chunk_size:
+        return [data]
+
+    # Read the original Arrow file
+    reader = pa.ipc.open_file(pa.py_buffer(data))
+    schema = reader.schema
+    batches = [batch for batch in reader]
+
+    # Create new chunks with complete Arrow files
+    chunks = []
+    current_batch_group = []
+    current_size = 0
+
+    for batch in batches:
+        # Serialize single batch to estimate size
+        batch_data = serialize_arrow_batch(batch)
+        batch_size = len(batch_data)
+
+        if current_size + batch_size > max_chunk_size and current_batch_group:
+            # Create a new Arrow file with current batch group
+            sink = pa.BufferOutputStream()
+            writer = ipc.new_file(sink, schema)
+            for b in current_batch_group:
+                writer.write_batch(b)
+            writer.close()
+            chunks.append(sink.getvalue().to_pybytes())
+
+            current_batch_group = [batch]
+            current_size = batch_size
+        else:
+            current_batch_group.append(batch)
+            current_size += batch_size
+
+    # Handle remaining batches
+    if current_batch_group:
+        sink = pa.BufferOutputStream()
+        writer = ipc.new_file(sink, schema)
+        for batch in current_batch_group:
+            writer.write_batch(batch)
+        writer.close()
+        chunks.append(sink.getvalue().to_pybytes())
+
+    return chunks
 
 
 def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
                   transfer_id: str, sequence_number: int, total_chunks: int) -> None:
     """
-    Publish a single batch of data to IoT topic with size checking and chunking.
+    Publish Arrow data in chunks while preserving Arrow IPC format.
     """
-    # Split data into appropriate chunks if needed
-    data_chunks = chunk_data(batch_data, MAX_DATA_SIZE)
-    total_chunks = len(data_chunks)
+    data_chunks = chunk_arrow_data(batch_data, MAX_DATA_SIZE)
 
     for idx, chunk in enumerate(data_chunks, start=1):
         message = {
@@ -97,7 +144,7 @@ def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
                 'transfer_id': transfer_id,
                 'sequence_number': sequence_number,
                 'chunk_number': idx,
-                'total_chunks': total_chunks,
+                'total_chunks': len(data_chunks),
                 'chunk_size': len(chunk),
                 'format': 'arrow_ipc',
                 'timestamp': int(time.time() * 1000)
@@ -115,7 +162,19 @@ def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
             qos=1,
             payload=json.dumps(message)
         )
-        print(f"Published sequence {sequence_number}, chunk {idx}/{total_chunks}")
+        print(f"Published sequence {sequence_number}, chunk {idx}/{len(data_chunks)}")
+
+
+def process_rows(rows: list, schema: pa.Schema, transfer_id: str, sequence_number: int) -> bytes:
+    """
+    Process a group of rows into an Arrow file format.
+    """
+    record_batch = create_record_batch(rows, schema)
+    sink = pa.BufferOutputStream()
+    writer = ipc.new_file(sink, schema)
+    writer.write_batch(record_batch)
+    writer.close()
+    return sink.getvalue().to_pybytes()
 
 
 def lambda_handler(event, context):
@@ -149,45 +208,24 @@ def lambda_handler(event, context):
 
         transfer_id = str(uuid.uuid4())
         sequence_number = 1
-        row_count = len(first_batch)
-
-        # Process and publish first batch
-        record_batch = create_record_batch(first_batch, schema)
-        sink = pa.BufferOutputStream()
-        with ipc.new_stream(sink, schema) as writer:
-            writer.write_batch(record_batch)
-        batch_data = sink.getvalue().to_pybytes()
-
-        publish_batch(iot_client, iot_topic, batch_data, transfer_id,
-                      sequence_number, -1)  # -1 for unknown total chunks initially
-
-        # Stream remaining results
+        row_count = 0
         buffer_rows = []
+
+        # Process rows in smaller batches
         for row in stream_query_results(cursor):
             buffer_rows.append(row)
             row_count += 1
 
             if len(buffer_rows) >= BATCH_SIZE:
-                sequence_number += 1
-                record_batch = create_record_batch(buffer_rows, schema)
-                sink = pa.BufferOutputStream()
-                with ipc.new_stream(sink, schema) as writer:
-                    writer.write_batch(record_batch)
-                batch_data = sink.getvalue().to_pybytes()
-
+                batch_data = process_rows(buffer_rows, schema, transfer_id, sequence_number)
                 publish_batch(iot_client, iot_topic, batch_data, transfer_id,
                               sequence_number, -1)
+                sequence_number += 1
                 buffer_rows = []
 
-        # Send any remaining rows
+        # Process remaining rows
         if buffer_rows:
-            sequence_number += 1
-            record_batch = create_record_batch(buffer_rows, schema)
-            sink = pa.BufferOutputStream()
-            with ipc.new_stream(sink, schema) as writer:
-                writer.write_batch(record_batch)
-            batch_data = sink.getvalue().to_pybytes()
-
+            batch_data = process_rows(buffer_rows, schema, transfer_id, sequence_number)
             publish_batch(iot_client, iot_topic, batch_data, transfer_id,
                           sequence_number, sequence_number)
 
@@ -196,7 +234,7 @@ def lambda_handler(event, context):
             'metadata': {
                 'rowCount': row_count,
                 'chunkCount': sequence_number,
-                'schema': schema_info
+                'schema': {field.name: str(field.type) for field in schema}
             }
         }
 
