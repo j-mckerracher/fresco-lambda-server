@@ -280,5 +280,6 @@ def add_limit_if_needed(query, row_limit=ROW_LIMIT):
     """Appends a LIMIT clause if needed"""
     print("Adding LIMIT clause if needed.")
     if 'LIMIT' not in query.upper():
+        print(f"Adding: LIMIT {row_limit}")
         return f"{query} LIMIT {row_limit}"
     return query
