@@ -10,10 +10,11 @@ import base64
 import uuid
 from typing import Iterator, Dict, Any
 import time
+import math
 
 # Constants
 MAX_MQTT_PAYLOAD_SIZE = 128 * 1024  # 128 KB
-CHUNK_SIZE = int((MAX_MQTT_PAYLOAD_SIZE - 200) * 0.75)  # AWS IoT MQTT payload limit
+MAX_DATA_SIZE = int(MAX_MQTT_PAYLOAD_SIZE * 0.7)  # Leave room for metadata and base64 encoding
 BATCH_SIZE = 1000  # Number of rows to process at once
 ROW_LIMIT = 1000
 
@@ -68,30 +69,53 @@ def create_record_batch(rows: list, schema: pa.Schema) -> pa.RecordBatch:
     return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
+def chunk_data(data: bytes, max_chunk_size: int) -> list:
+    """
+    Split data into chunks that will fit within MQTT payload limits after base64 encoding
+    """
+    # Calculate base64 encoded size
+    encoded_size = math.ceil(len(data) * 4 / 3)
+    num_chunks = math.ceil(encoded_size / max_chunk_size)
+    chunk_size = math.ceil(len(data) / num_chunks)
+
+    return [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
+
+
 def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
                   transfer_id: str, sequence_number: int, total_chunks: int) -> None:
     """
-    Publish a single batch of data to IoT topic.
+    Publish a single batch of data to IoT topic with size checking and chunking.
     """
-    message = {
-        'type': 'arrow_data',
-        'metadata': {
-            'transfer_id': transfer_id,
-            'sequence_number': sequence_number,
-            'total_chunks': total_chunks,
-            'chunk_size': len(batch_data),
-            'format': 'arrow_ipc',
-            'timestamp': int(time.time() * 1000)  # Add timestamp for monitoring
-        },
-        'data': base64.b64encode(batch_data).decode('utf-8')
-    }
+    # Split data into appropriate chunks if needed
+    data_chunks = chunk_data(batch_data, MAX_DATA_SIZE)
+    total_chunks = len(data_chunks)
 
-    iot_client.publish(
-        topic=topic,
-        qos=1,
-        payload=json.dumps(message)
-    )
-    print(f"Published chunk {sequence_number}")
+    for idx, chunk in enumerate(data_chunks, start=1):
+        message = {
+            'type': 'arrow_data',
+            'metadata': {
+                'transfer_id': transfer_id,
+                'sequence_number': sequence_number,
+                'chunk_number': idx,
+                'total_chunks': total_chunks,
+                'chunk_size': len(chunk),
+                'format': 'arrow_ipc',
+                'timestamp': int(time.time() * 1000)
+            },
+            'data': base64.b64encode(chunk).decode('utf-8')
+        }
+
+        # Verify final message size
+        message_bytes = json.dumps(message).encode('utf-8')
+        if len(message_bytes) > MAX_MQTT_PAYLOAD_SIZE:
+            raise ValueError(f"Message size ({len(message_bytes)} bytes) exceeds MQTT limit")
+
+        iot_client.publish(
+            topic=topic,
+            qos=1,
+            payload=json.dumps(message)
+        )
+        print(f"Published sequence {sequence_number}, chunk {idx}/{total_chunks}")
 
 
 def lambda_handler(event, context):
@@ -127,7 +151,7 @@ def lambda_handler(event, context):
         sequence_number = 1
         row_count = len(first_batch)
 
-        # Create and publish first batch
+        # Process and publish first batch
         record_batch = create_record_batch(first_batch, schema)
         sink = pa.BufferOutputStream()
         with ipc.new_stream(sink, schema) as writer:
@@ -135,7 +159,7 @@ def lambda_handler(event, context):
         batch_data = sink.getvalue().to_pybytes()
 
         publish_batch(iot_client, iot_topic, batch_data, transfer_id,
-                      sequence_number, -1)  # -1 for unknown total chunks
+                      sequence_number, -1)  # -1 for unknown total chunks initially
 
         # Stream remaining results
         buffer_rows = []
@@ -186,7 +210,7 @@ def lambda_handler(event, context):
             db_pool.putconn(conn)
 
 
-# Keeping the existing helper functions
+# Helper functions remain unchanged
 def is_query_safe(query):
     """Validates the SQL query for safety"""
     print("Validating SQL query for safety.")
