@@ -1,23 +1,20 @@
 import json
-import math
 import os
 import psycopg2.pool
 import sqlparse
 import pyarrow as pa
 import pyarrow.ipc as ipc
-from psycopg2 import extras
 import boto3
 import base64
 import uuid
 from typing import Iterator, Dict, Any, List
 import time
-import io
 
 # Constants
 MAX_MQTT_PAYLOAD_SIZE = 128 * 1024  # 128 KB
 MAX_DATA_SIZE = int(MAX_MQTT_PAYLOAD_SIZE * 0.7)  # Leave room for metadata and base64 encoding
-BATCH_SIZE = 500  # Reduced batch size for better chunking
-ROW_LIMIT = 100
+DEFAULT_BATCH_SIZE = 500  # Default batch size
+DEFAULT_ROW_LIMIT = 1000000  # Set a high default row limit for large datasets
 
 # Initialize the PostgreSQL connection pool
 try:
@@ -47,16 +44,15 @@ except Exception as e:
     iot_client = None
 
 
-def stream_query_results(cursor) -> Iterator[Dict[str, Any]]:
+def stream_query_results(cursor, batch_size) -> Iterator[List[tuple]]:
     """
     Generator function to stream results from the database in batches.
     """
     while True:
-        rows = cursor.fetchmany(BATCH_SIZE)
+        rows = cursor.fetchmany(batch_size)
         if not rows:
             break
-        for row in rows:
-            yield row
+        yield rows
 
 
 def create_record_batch(rows: list, schema: pa.Schema) -> pa.RecordBatch:
@@ -64,9 +60,9 @@ def create_record_batch(rows: list, schema: pa.Schema) -> pa.RecordBatch:
     Convert a list of rows to a PyArrow RecordBatch.
     """
     arrays = []
-    for field in schema:
-        array_data = [row[field.name] for row in rows]
-        arrays.append(pa.array(array_data))
+    for i, field in enumerate(schema):
+        array_data = [row[i] for row in rows]
+        arrays.append(pa.array(array_data, type=field.type))
     return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
@@ -75,7 +71,7 @@ def serialize_arrow_batch(record_batch: pa.RecordBatch) -> bytes:
     Serialize a single record batch to bytes using Arrow IPC format.
     """
     sink = pa.BufferOutputStream()
-    writer = ipc.new_file(sink, record_batch.schema)
+    writer = ipc.new_stream(sink, record_batch.schema)
     writer.write_batch(record_batch)
     writer.close()
     return sink.getvalue().to_pybytes()
@@ -83,172 +79,201 @@ def serialize_arrow_batch(record_batch: pa.RecordBatch) -> bytes:
 
 def chunk_arrow_data(data: bytes, max_chunk_size: int) -> List[bytes]:
     """
-    Split Arrow data into chunks while preserving Arrow IPC format.
+    Split data into chunks that fit within the max_chunk_size.
     """
-    if len(data) <= max_chunk_size:
-        return [data]
-
-    # Read the original Arrow file
-    reader = pa.ipc.open_file(pa.py_buffer(data))
-    schema = reader.schema
-    batches = [batch for batch in reader]
-
-    # Create new chunks with complete Arrow files
     chunks = []
-    current_batch_group = []
-    current_size = 0
+    data_size = len(data)
+    start = 0
 
-    for batch in batches:
-        # Serialize single batch to estimate size
-        batch_data = serialize_arrow_batch(batch)
-        batch_size = len(batch_data)
-
-        if current_size + batch_size > max_chunk_size and current_batch_group:
-            # Create a new Arrow file with current batch group
-            sink = pa.BufferOutputStream()
-            writer = ipc.new_file(sink, schema)
-            for b in current_batch_group:
-                writer.write_batch(b)
-            writer.close()
-            chunks.append(sink.getvalue().to_pybytes())
-
-            current_batch_group = [batch]
-            current_size = batch_size
-        else:
-            current_batch_group.append(batch)
-            current_size += batch_size
-
-    # Handle remaining batches
-    if current_batch_group:
-        sink = pa.BufferOutputStream()
-        writer = ipc.new_file(sink, schema)
-        for batch in current_batch_group:
-            writer.write_batch(batch)
-        writer.close()
-        chunks.append(sink.getvalue().to_pybytes())
+    while start < data_size:
+        end = min(start + max_chunk_size, data_size)
+        chunk = data[start:end]
+        chunks.append(chunk)
+        start = end
 
     return chunks
 
 
 def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
-                  transfer_id: str, sequence_number: int, total_chunks: int) -> None:
+                  transfer_id: str, sequence_number: int, max_chunk_size: int = MAX_DATA_SIZE) -> None:
     """
-    Publish Arrow data in chunks while preserving Arrow IPC format.
+    Publish Arrow Stream IPC data, splitting into chunks if necessary.
     """
-    data_chunks = chunk_arrow_data(batch_data, MAX_DATA_SIZE)
+    # Split the batch_data into chunks if it exceeds max_chunk_size
+    chunks = chunk_arrow_data(batch_data, max_chunk_size)
+    total_chunks = len(chunks)
 
-    for idx, chunk in enumerate(data_chunks, start=1):
+    print(f"Publishing {total_chunks} chunks for sequence {sequence_number} to topic {topic}.")
+
+    for chunk_number, chunk_data in enumerate(chunks, start=1):
         message = {
             'type': 'arrow_data',
             'metadata': {
                 'transfer_id': transfer_id,
                 'sequence_number': sequence_number,
-                'chunk_number': idx,
-                'total_chunks': len(data_chunks),
-                'chunk_size': len(chunk),
-                'format': 'arrow_ipc',
-                'timestamp': int(time.time() * 1000)
+                'chunk_number': chunk_number,
+                'total_chunks': total_chunks,
+                'chunk_size': len(chunk_data),
+                'format': 'arrow_stream_ipc',
+                'timestamp': int(time.time() * 1000),
+                'is_final_sequence': (sequence_number == 1 and chunk_number == total_chunks)  # Added flag
             },
-            'data': base64.b64encode(chunk).decode('utf-8')
+            'data': base64.b64encode(chunk_data).decode('utf-8')
         }
 
-        # Verify final message size
+        # Verify message size and print size info
         message_bytes = json.dumps(message).encode('utf-8')
-        if len(message_bytes) > MAX_MQTT_PAYLOAD_SIZE:
-            raise ValueError(f"Message size ({len(message_bytes)} bytes) exceeds MQTT limit")
+        message_size = len(message_bytes)
+        print(f"Message size for chunk {chunk_number}: {message_size} bytes")
 
-        iot_client.publish(
-            topic=topic,
-            qos=1,
-            payload=json.dumps(message)
-        )
-        print(f"Published sequence {sequence_number}, chunk {idx}/{len(data_chunks)}")
+        if message_size > MAX_MQTT_PAYLOAD_SIZE:
+            raise ValueError(f"Message size ({message_size} bytes) exceeds MQTT limit")
+
+        try:
+            # Add a small delay between publishing chunks
+            if chunk_number > 1:
+                time.sleep(0.1)  # 100ms delay between chunks
+
+            # Publish the chunk
+            response = iot_client.publish(
+                topic=topic,
+                qos=1,
+                payload=json.dumps(message)
+            )
+            print(f"Published sequence {sequence_number}, chunk {chunk_number}/{total_chunks}")
+            print(f"IoT publish response: {json.dumps(response, default=str)}")
+        except Exception as e:
+            print(f"Error publishing chunk {chunk_number}: {str(e)}")
+            raise
+
+    print(f"Completed publishing sequence {sequence_number}.")
 
 
-def process_rows(rows: list, schema: pa.Schema, transfer_id: str, sequence_number: int) -> bytes:
+def process_rows(rows: list, schema: pa.Schema) -> bytes:
     """
-    Process a group of rows into an Arrow file format.
+    Process a group of rows into an Arrow Stream IPC format.
     """
     record_batch = create_record_batch(rows, schema)
-    sink = pa.BufferOutputStream()
-    writer = ipc.new_file(sink, schema)
-    writer.write_batch(record_batch)
-    writer.close()
-    return sink.getvalue().to_pybytes()
+    return serialize_arrow_batch(record_batch)
 
 
 def lambda_handler(event, context):
     print("Received event:", json.dumps(event))
 
     try:
+        # Extract parameters from the event
         query = event['arguments']['query']
+        transfer_id = event['arguments'].get('transferId', str(uuid.uuid4()))
+        row_limit = event['arguments'].get('rowLimit', DEFAULT_ROW_LIMIT)
+        batch_size = event['arguments'].get('batchSize', DEFAULT_BATCH_SIZE)
+
+        print(f"Starting query execution with transfer ID: {transfer_id}")
+        print(f"Query: {query}")
+        print(f"Row limit: {row_limit}, Batch size: {batch_size}")
+
         if not is_query_safe(query):
             raise Exception('Unsafe SQL query.')
 
-        query_with_limit = add_limit_if_needed(query)
+        query_with_limit = add_limit_if_needed(query, row_limit)
 
         if db_pool is None:
             raise Exception('Database connection pool is not initialized.')
 
-        conn = db_pool.getconn()
-        cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
-        cursor.itersize = BATCH_SIZE  # Set server-side cursor size
+        # Add a small delay before starting query execution
+        time.sleep(1)
+        print("Starting query execution after delay...")
 
-        # Execute query with server-side cursor
+        conn = db_pool.getconn()
+        cursor_name = f"cursor_{uuid.uuid4().hex}"
+        cursor = conn.cursor(name=cursor_name)
+        cursor.itersize = batch_size
+
+        print(f"Executing query with limit: {query_with_limit}")
         cursor.execute(query_with_limit)
 
-        # Get the first batch to determine schema
-        first_batch = cursor.fetchmany(BATCH_SIZE)
+        first_batch = cursor.fetchmany(batch_size)
         if not first_batch:
-            raise Exception('No data returned from query.')
+            print('No data returned from query.')
+            return {
+                'transferId': transfer_id,
+                'metadata': {
+                    'rowCount': 0,
+                    'chunkCount': 0,
+                    'schema': {}
+                }
+            }
 
-        # Create PyArrow schema from first batch
-        schema = pa.Schema.from_pandas(pa.Table.from_pylist(first_batch).to_pandas())
+        column_names = [desc[0] for desc in cursor.description]
+        print(f"Column names: {column_names}")
+
+        table = pa.Table.from_arrays(
+            [pa.array([row[i] for row in first_batch]) for i in range(len(column_names))],
+            names=column_names
+        )
+        schema = table.schema
         schema_info = {field.name: str(field.type) for field in schema}
+        print(f"Determined schema: {json.dumps(schema_info)}")
 
-        transfer_id = str(uuid.uuid4())
         sequence_number = 1
         row_count = 0
-        buffer_rows = []
 
-        # Process rows in smaller batches
-        for row in stream_query_results(cursor):
-            buffer_rows.append(row)
-            row_count += 1
+        print(f"Starting to process and publish rows for transfer ID: {transfer_id}")
 
-            if len(buffer_rows) >= BATCH_SIZE:
-                batch_data = process_rows(buffer_rows, schema, transfer_id, sequence_number)
-                publish_batch(iot_client, iot_topic, batch_data, transfer_id,
-                              sequence_number, -1)
-                sequence_number += 1
-                buffer_rows = []
+        # Process and publish the first batch
+        row_count += len(first_batch)
+        print(f"Processing batch {sequence_number} with {len(first_batch)} rows.")
+        batch_data = process_rows(first_batch, schema)
+        publish_batch(iot_client, iot_topic, batch_data, transfer_id, sequence_number)
 
-        # Process remaining rows
-        if buffer_rows:
-            batch_data = process_rows(buffer_rows, schema, transfer_id, sequence_number)
-            publish_batch(iot_client, iot_topic, batch_data, transfer_id,
-                          sequence_number, sequence_number)
+        # If there's only one batch, we're done
+        if len(first_batch) < batch_size:
+            print("Query complete - only one batch needed.")
+            return {
+                'transferId': transfer_id,
+                'metadata': {
+                    'rowCount': row_count,
+                    'chunkCount': 1,
+                    'schema': schema_info
+                }
+            }
+
+        # Process and publish remaining batches
+        sequence_number += 1
+        for batch_rows in stream_query_results(cursor, batch_size):
+            row_count += len(batch_rows)
+            print(f"Processing batch {sequence_number} with {len(batch_rows)} rows.")
+            batch_data = process_rows(batch_rows, schema)
+            publish_batch(iot_client, iot_topic, batch_data, transfer_id, sequence_number)
+            sequence_number += 1
+
+            # Break if we've hit the row limit
+            if row_count >= row_limit:
+                print(f"Row limit {row_limit} reached. Stopping query execution.")
+                break
+
+        print(f"Completed processing and publishing all rows. Total rows: {row_count}")
 
         return {
             'transferId': transfer_id,
             'metadata': {
                 'rowCount': row_count,
-                'chunkCount': sequence_number,
-                'schema': {field.name: str(field.type) for field in schema}
+                'chunkCount': sequence_number - 1,
+                'schema': schema_info
             }
         }
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error in lambda_handler: {str(e)}")
         raise
     finally:
         if 'cursor' in locals():
             cursor.close()
+            print("Database cursor closed.")
         if 'conn' in locals():
             db_pool.putconn(conn)
+            print("Database connection returned to pool.")
 
 
-# Helper functions remain unchanged
 def is_query_safe(query):
     """Validates the SQL query for safety"""
     print("Validating SQL query for safety.")
@@ -273,13 +298,15 @@ def is_query_safe(query):
         print("Semicolon detected in query.")
         return False
 
+    print("SQL query is considered safe.")
     return True
 
 
-def add_limit_if_needed(query, row_limit=ROW_LIMIT):
+def add_limit_if_needed(query, row_limit=DEFAULT_ROW_LIMIT):
     """Appends a LIMIT clause if needed"""
     print("Adding LIMIT clause if needed.")
     if 'LIMIT' not in query.upper():
         print(f"Adding: LIMIT {row_limit}")
         return f"{query} LIMIT {row_limit}"
+    print("LIMIT clause already present in query.")
     return query
