@@ -8,24 +8,20 @@ from psycopg2 import extras
 import boto3
 import base64
 import uuid
-from operator import itemgetter
-import concurrent.futures
-import threading
-import queue
+from typing import Iterator, Dict, Any
 import time
 
 # Constants
 MAX_MQTT_PAYLOAD_SIZE = 128 * 1024  # 128 KB
 CHUNK_SIZE = int((MAX_MQTT_PAYLOAD_SIZE - 200) * 0.75)  # AWS IoT MQTT payload limit
+BATCH_SIZE = 1000  # Number of rows to process at once
 ROW_LIMIT = 1000
-PUBLISH_WORKERS = 5  # Number of parallel publishing threads
-QUEUE_MAX_SIZE = 100  # Maximum number of chunks in the queue for backpressure
 
-# Initialize the PostgreSQL connection pool as a global variable
+# Initialize the PostgreSQL connection pool
 try:
     db_pool = psycopg2.pool.SimpleConnectionPool(
         minconn=1,
-        maxconn=20,  # Adjust based on expected concurrency and database limits
+        maxconn=20,
         user=os.environ['DB_USER'],
         password=os.environ['DB_PASSWORD'],
         host=os.environ['DB_HOST'],
@@ -35,9 +31,9 @@ try:
     print("Database connection pool created successfully.")
 except Exception as e:
     print(f"Error creating database connection pool: {e}")
-    db_pool = None  # Handle this in the handler
+    db_pool = None
 
-# Initialize AWS IoT Data client using boto3
+# Initialize AWS IoT client
 try:
     iot_endpoint = os.environ['IOT_ENDPOINT']
     iot_topic = os.environ['IOT_TOPIC']
@@ -46,112 +42,153 @@ try:
     print("AWS IoT Data client initialized successfully.")
 except Exception as e:
     print(f"Error initializing AWS IoT Data client: {e}")
-    iot_client = None  # Handle this in the handler
+    iot_client = None
+
+
+def stream_query_results(cursor) -> Iterator[Dict[str, Any]]:
+    """
+    Generator function to stream results from the database in batches.
+    """
+    while True:
+        rows = cursor.fetchmany(BATCH_SIZE)
+        if not rows:
+            break
+        for row in rows:
+            yield row
+
+
+def create_record_batch(rows: list, schema: pa.Schema) -> pa.RecordBatch:
+    """
+    Convert a list of rows to a PyArrow RecordBatch.
+    """
+    arrays = []
+    for field in schema:
+        array_data = [row[field.name] for row in rows]
+        arrays.append(pa.array(array_data))
+    return pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+
+def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
+                  transfer_id: str, sequence_number: int, total_chunks: int) -> None:
+    """
+    Publish a single batch of data to IoT topic.
+    """
+    message = {
+        'type': 'arrow_data',
+        'metadata': {
+            'transfer_id': transfer_id,
+            'sequence_number': sequence_number,
+            'total_chunks': total_chunks,
+            'chunk_size': len(batch_data),
+            'format': 'arrow_ipc',
+            'timestamp': int(time.time() * 1000)  # Add timestamp for monitoring
+        },
+        'data': base64.b64encode(batch_data).decode('utf-8')
+    }
+
+    iot_client.publish(
+        topic=topic,
+        qos=1,
+        payload=json.dumps(message)
+    )
+    print(f"Published chunk {sequence_number}")
 
 
 def lambda_handler(event, context):
-    """
-    Lambda function handler to process GraphQL queries, execute SQL against PostgreSQL,
-    serialize the results to Apache Arrow IPC format, publish the data in chunks to AWS IoT,
-    and return metadata about the published data.
-    """
     print("Received event:", json.dumps(event))
 
     try:
-        # Extract the SQL query from the AppSync event arguments
         query = event['arguments']['query']
-        print(f"Extracted query: {query}")
-    except KeyError:
-        print("No query provided in the arguments.")
-        return {
-            'error': 'No query provided.'
-        }
+        if not is_query_safe(query):
+            raise Exception('Unsafe SQL query.')
 
-    # Validate the SQL query
-    if not is_query_safe(query):
-        print("Unsafe SQL query detected.")
-        return {
-            'error': 'Unsafe SQL query.'
-        }
+        query_with_limit = add_limit_if_needed(query)
 
-    # Add LIMIT clause if needed
-    query_with_limit = add_limit_if_needed(query)
-    print(f"Final query to execute: {query_with_limit}")
+        if db_pool is None:
+            raise Exception('Database connection pool is not initialized.')
 
-    # Connect to the database using the connection pool
-    if db_pool is None:
-        print("Database connection pool is not initialized.")
-        return {
-            'error': 'Database connection pool is not initialized.'
-        }
-
-    try:
         conn = db_pool.getconn()
-        print("Acquired database connection from pool.")
-    except Exception as e:
-        print(f"Error acquiring database connection: {e}")
+        cursor = conn.cursor(cursor_factory=extras.RealDictCursor)
+        cursor.itersize = BATCH_SIZE  # Set server-side cursor size
+
+        # Execute query with server-side cursor
+        cursor.execute(query_with_limit)
+
+        # Get the first batch to determine schema
+        first_batch = cursor.fetchmany(BATCH_SIZE)
+        if not first_batch:
+            raise Exception('No data returned from query.')
+
+        # Create PyArrow schema from first batch
+        schema = pa.Schema.from_pandas(pa.Table.from_pylist(first_batch).to_pandas())
+        schema_info = {field.name: str(field.type) for field in schema}
+
+        transfer_id = str(uuid.uuid4())
+        sequence_number = 1
+        row_count = len(first_batch)
+
+        # Create and publish first batch
+        record_batch = create_record_batch(first_batch, schema)
+        sink = pa.BufferOutputStream()
+        with ipc.new_stream(sink, schema) as writer:
+            writer.write_batch(record_batch)
+        batch_data = sink.getvalue().to_pybytes()
+
+        publish_batch(iot_client, iot_topic, batch_data, transfer_id,
+                      sequence_number, -1)  # -1 for unknown total chunks
+
+        # Stream remaining results
+        buffer_rows = []
+        for row in stream_query_results(cursor):
+            buffer_rows.append(row)
+            row_count += 1
+
+            if len(buffer_rows) >= BATCH_SIZE:
+                sequence_number += 1
+                record_batch = create_record_batch(buffer_rows, schema)
+                sink = pa.BufferOutputStream()
+                with ipc.new_stream(sink, schema) as writer:
+                    writer.write_batch(record_batch)
+                batch_data = sink.getvalue().to_pybytes()
+
+                publish_batch(iot_client, iot_topic, batch_data, transfer_id,
+                              sequence_number, -1)
+                buffer_rows = []
+
+        # Send any remaining rows
+        if buffer_rows:
+            sequence_number += 1
+            record_batch = create_record_batch(buffer_rows, schema)
+            sink = pa.BufferOutputStream()
+            with ipc.new_stream(sink, schema) as writer:
+                writer.write_batch(record_batch)
+            batch_data = sink.getvalue().to_pybytes()
+
+            publish_batch(iot_client, iot_topic, batch_data, transfer_id,
+                          sequence_number, sequence_number)
+
         return {
-            'error': 'Failed to acquire database connection.'
+            'transferId': transfer_id,
+            'metadata': {
+                'rowCount': row_count,
+                'chunkCount': sequence_number,
+                'schema': schema_info
+            }
         }
 
-    # Initialize a queue for backpressure handling
-    publish_queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
-
-    # Event to signal publishing completion
-    publishing_done = threading.Event()
-
-    # Generate a unique transfer ID for this data transfer
-    transfer_id = str(uuid.uuid4())
-    print(f"Generated Transfer ID: {transfer_id}")
-
-    try:
-        # Start publisher threads
-        with concurrent.futures.ThreadPoolExecutor(max_workers=PUBLISH_WORKERS) as executor:
-            # Start publisher workers
-            futures = []
-            for _ in range(PUBLISH_WORKERS):
-                futures.append(executor.submit(publisher_worker, iot_client, iot_topic, publish_queue, publishing_done))
-
-            # Execute the query and serialize in chunks
-            row_count, schema_info, total_chunks = execute_query_and_serialize_stream(conn, query_with_limit,
-                                                                                      publish_queue, transfer_id)
-
-            # After all chunks are queued, signal that publishing is done
-            publishing_done.set()
-
-            # Wait for all publisher threads to finish
-            concurrent.futures.wait(futures)
-
     except Exception as e:
-        print(f"Error during query execution or publishing: {e}")
-        return {
-            'error': 'Failed to execute query or publish data.'
-        }
+        print(f"Error: {e}")
+        raise
     finally:
-        # Release the connection back to the pool
-        db_pool.putconn(conn)
-        print("Released database connection back to pool.")
-
-    if row_count == 0:
-        print("No data returned from query.")
-        return {
-            'error': 'No data returned from query.'
-        }
-
-    # Return the transferId and related metadata
-    return {
-        'transferId': transfer_id,
-        'rowCount': row_count,
-        'schema': schema_info,
-        'totalChunks': total_chunks
-    }
+        if 'cursor' in locals():
+            cursor.close()
+        if 'conn' in locals():
+            db_pool.putconn(conn)
 
 
+# Keeping the existing helper functions
 def is_query_safe(query):
-    """
-    Validates the SQL query for safety by checking for disallowed keywords and semicolons.
-    Returns True if the query is considered safe, False otherwise.
-    """
+    """Validates the SQL query for safety"""
     print("Validating SQL query for safety.")
     disallowed_keywords = [
         'INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE',
@@ -174,132 +211,12 @@ def is_query_safe(query):
         print("Semicolon detected in query.")
         return False
 
-    print("SQL query is considered safe.")
     return True
 
 
 def add_limit_if_needed(query, row_limit=ROW_LIMIT):
-    """
-    Appends a LIMIT clause to the SQL query if it's not already present.
-    """
+    """Appends a LIMIT clause if needed"""
     print("Adding LIMIT clause if needed.")
     if 'LIMIT' not in query.upper():
-        limited_query = f"{query} LIMIT {row_limit}"
-        print(f"LIMIT added to query: {limited_query}")
-        return limited_query
-    else:
-        print("Query already contains LIMIT.")
-        return query
-
-
-def execute_query_and_serialize_stream(conn, query, publish_queue, transfer_id):
-    """
-    Executes the SQL query using a server-side cursor, fetches data in chunks,
-    serializes each chunk to Apache Arrow IPC format, and puts serialized chunks into the publish queue.
-    Returns total row count, schema information, and total number of chunks.
-    """
-    print(f"Executing query with streaming: {query}")
-    with conn.cursor(name='stream_cursor', cursor_factory=extras.RealDictCursor) as cursor:
-        cursor.itersize = ROW_LIMIT  # Number of rows to fetch per batch
-        cursor.execute(query)
-        total_rows = 0
-        schema_info = {}
-        total_chunks = 0
-
-        while True:
-            rows = cursor.fetchmany(cursor.itersize)
-            if not rows:
-                break
-
-            batch_size = len(rows)
-            total_rows += batch_size
-            print(f"Fetched {batch_size} rows. Total rows so far: {total_rows}")
-
-            # Convert list of dicts to PyArrow Table
-            table = pa.Table.from_pylist(rows)
-            print("Converted rows to PyArrow Table.")
-
-            # Extract schema information once
-            if not schema_info:
-                schema_info = {
-                    field.name: str(field.type)
-                    for field in table.schema
-                }
-                print(f"Schema Information: {schema_info}")
-
-            # Serialize the table to Apache Arrow IPC format
-            sink = pa.BufferOutputStream()
-            with ipc.RecordBatchStreamWriter(sink, table.schema) as writer:
-                writer.write_table(table)
-            arrow_data = sink.getvalue().to_pybytes()
-            print("Serialized data to Apache Arrow IPC format.")
-
-            # Split serialized data into MQTT-sized chunks
-            for i in range(0, len(arrow_data), CHUNK_SIZE):
-                chunk = arrow_data[i:i + CHUNK_SIZE]
-                chunk_size = len(chunk)
-                sequence_number = total_chunks + 1  # Starting from 1
-                total_chunks += 1
-
-                # Create message structure
-                message = {
-                    'type': 'arrow_data',  # Type indicator
-                    'metadata': {
-                        'transfer_id': transfer_id,  # Shared transfer_id for all chunks
-                        'sequence_number': sequence_number,
-                        'total_chunks': None,  # Optional: Update after all chunks are determined
-                        'chunk_size': chunk_size,
-                        'format': 'arrow_ipc'  # Data format
-                    },
-                    'data': base64.b64encode(chunk).decode('utf-8')
-                }
-
-                # Put the chunk into the queue (blocks if queue is full)
-                try:
-                    publish_queue.put_nowait(message)
-                    print(f"Queued chunk {sequence_number}")
-                except queue.Full:
-                    print("Publish queue is full. Implementing backpressure.")
-                    # Implement backpressure: wait until there's space
-                    while True:
-                        try:
-                            publish_queue.put(message, timeout=1)
-                            print(f"Queued chunk {sequence_number} after waiting")
-                            break
-                        except queue.Full:
-                            print("Waiting for space in publish queue...")
-                            continue
-
-    print(f"Completed fetching and queuing data. Total rows: {total_rows}, Total chunks: {total_chunks}")
-    return total_rows, schema_info, total_chunks
-
-
-def publisher_worker(iot_client, topic, publish_queue, publishing_done_event):
-    """
-    Worker function to publish chunks from the queue to the IoT topic.
-    Continues until publishing_done_event is set and the queue is empty.
-    """
-    while not publishing_done_event.is_set() or not publish_queue.empty():
-        try:
-            message = publish_queue.get(timeout=1)
-            payload_json = json.dumps(message)
-            payload_size = len(payload_json.encode('utf-8'))
-
-            if payload_size > MAX_MQTT_PAYLOAD_SIZE:
-                print(f"Payload size {payload_size} exceeds MQTT limit. Skipping chunk.")
-                publish_queue.task_done()
-                continue  # Or handle accordingly
-
-            # Publish the message
-            iot_client.publish(
-                topic=topic,
-                qos=1,  # At-least-once delivery
-                payload=payload_json
-            )
-            print(f"Published chunk {message['metadata']['sequence_number']}")
-            publish_queue.task_done()
-        except queue.Empty:
-            continue  # Check if publishing is done
-        except Exception as e:
-            print(f"Error publishing chunk {message.get('metadata', {}).get('sequence_number', 'Unknown')}: {e}")
-            publish_queue.task_done()
+        return f"{query} LIMIT {row_limit}"
+    return query
