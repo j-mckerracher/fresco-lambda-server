@@ -7,8 +7,11 @@ import pyarrow.ipc as ipc
 import boto3
 import base64
 import uuid
-from typing import Iterator, Dict, Any, List
+from typing import Iterator, Dict, Any, List, Tuple
 import time
+import threading
+from queue import Queue, Empty
+import concurrent.futures
 
 # Constants
 MAX_MQTT_PAYLOAD_SIZE = 128 * 1024  # 128 KB
@@ -44,6 +47,112 @@ except Exception as e:
     iot_client = None
 
 
+class BatchPublisher:
+    def __init__(self, iot_client, topic, transfer_id, max_chunk_size=MAX_DATA_SIZE):
+        self.iot_client = iot_client
+        self.topic = topic
+        self.transfer_id = transfer_id
+        self.max_chunk_size = max_chunk_size
+        self.sequence_number = 0
+        self.publish_queue = Queue()
+        self.publish_thread = threading.Thread(target=self._publish_worker, daemon=True)
+        self.is_running = True
+        self.error = None
+        self.publish_thread.start()
+        print(f"BatchPublisher initialized for transfer {transfer_id}")
+
+    def _publish_worker(self):
+        print("Publisher worker thread started")
+        while self.is_running:
+            try:
+                try:
+                    batch_item = self.publish_queue.get(timeout=1)
+                except Empty:
+                    continue
+
+                if batch_item is None:
+                    print("Received shutdown signal")
+                    break
+
+                try:
+                    self._publish_batch(batch_item)
+                    self.publish_queue.task_done()
+                except Exception as e:
+                    print(f"Error publishing batch: {str(e)}")
+                    self.error = e
+                    self.is_running = False
+                    break
+
+            except Exception as e:
+                print(f"Error in publish worker: {str(e)}")
+                self.error = e
+                self.is_running = False
+                break
+
+        print("Publisher worker thread ending")
+
+    def _publish_batch(self, batch_item: Tuple[bytes, bool]):
+        batch_data, is_final = batch_item
+        self.sequence_number += 1
+        chunks = chunk_arrow_data(batch_data, self.max_chunk_size)
+        total_chunks = len(chunks)
+
+        print(f"Publishing batch {self.sequence_number} with {total_chunks} chunks (final: {is_final})")
+
+        for chunk_number, chunk_data in enumerate(chunks, start=1):
+            is_final_sequence = is_final and (chunk_number == total_chunks)
+
+            message = {
+                'type': 'arrow_data',
+                'metadata': {
+                    'transfer_id': self.transfer_id,
+                    'sequence_number': self.sequence_number,
+                    'chunk_number': chunk_number,
+                    'total_chunks': total_chunks,
+                    'chunk_size': len(chunk_data),
+                    'format': 'arrow_stream_ipc',
+                    'timestamp': int(time.time() * 1000),
+                    'is_final_sequence': is_final_sequence
+                },
+                'data': base64.b64encode(chunk_data).decode('utf-8')
+            }
+
+            try:
+                response = self.iot_client.publish(
+                    topic=self.topic,
+                    qos=1,
+                    payload=json.dumps(message)
+                )
+                print(f"Published sequence {self.sequence_number}, chunk {chunk_number}/{total_chunks} "
+                      f"(is_final_sequence: {is_final_sequence})")
+            except Exception as e:
+                print(f"Error publishing message: {e}")
+                raise
+
+    def publish(self, batch_data: bytes, is_final: bool = False):
+        if self.error:
+            raise self.error
+        self.publish_queue.put((batch_data, is_final))
+
+    def wait_completion(self, timeout=None):
+        print("Waiting for publisher completion")
+        try:
+            self.publish_queue.join()
+            self.is_running = False
+            self.publish_queue.put(None)  # Signal to stop the worker thread
+            if timeout:
+                self.publish_thread.join(timeout)
+            else:
+                self.publish_thread.join()
+
+            if self.error:
+                raise self.error
+
+        except Exception as e:
+            print(f"Error during publisher shutdown: {str(e)}")
+            raise
+
+
 def stream_query_results(cursor, batch_size) -> Iterator[List[tuple]]:
     """
     Generator function to stream results from the database in batches.
@@ -57,12 +166,44 @@ def stream_query_results(cursor, batch_size) -> Iterator[List[tuple]]:
 
 def create_record_batch(rows: list, schema: pa.Schema) -> pa.RecordBatch:
     """
-    Convert a list of rows to a PyArrow RecordBatch.
+    Convert a list of rows to a PyArrow RecordBatch with proper null handling.
     """
     arrays = []
     for i, field in enumerate(schema):
-        array_data = [row[i] for row in rows]
-        arrays.append(pa.array(array_data, type=field.type))
+        array_data = [row[i] if row[i] is not None else None for row in rows]
+        try:
+            # Handle different types appropriately
+            if field.name == 'value_gpu':
+                # Create float64 array for GPU values, allowing nulls
+                arrays.append(pa.array(array_data, type=pa.float64(), from_pandas=True))
+            elif pa.types.is_timestamp(field.type):
+                arrays.append(pa.array(array_data, type=field.type))
+            elif pa.types.is_string(field.type):
+                arrays.append(pa.array(['' if x is None else str(x) for x in array_data]))
+            elif pa.types.is_integer(field.type):
+                arrays.append(pa.array(array_data, type=field.type, from_pandas=True))
+            elif pa.types.is_floating(field.type):
+                arrays.append(pa.array(array_data, type=field.type, from_pandas=True))
+            else:
+                # For other types, attempt direct conversion with pandas null handling
+                arrays.append(pa.array(array_data, type=field.type, from_pandas=True))
+        except Exception as e:
+            print(f"Error creating array for field {field.name} of type {field.type}: {str(e)}")
+            print(f"Sample data: {array_data[:5]}")
+
+            # Fallback handling for problematic columns
+            if pa.types.is_floating(field.type) or field.name == 'value_gpu':
+                try:
+                    # Try creating with explicit null handling
+                    arrays.append(pa.array([0.0 if x is None else float(x) for x in array_data],
+                                           type=pa.float64(),
+                                           from_pandas=True))
+                    print(f"Successfully created array for {field.name} using fallback method")
+                    continue
+                except Exception as e2:
+                    print(f"Fallback method also failed for {field.name}: {str(e2)}")
+            raise
+
     return pa.RecordBatch.from_arrays(arrays, schema=schema)
 
 
@@ -103,7 +244,8 @@ def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
     chunks = chunk_arrow_data(batch_data, max_chunk_size)
     total_chunks = len(chunks)
 
-    print(f"Publishing {total_chunks} chunks for sequence {sequence_number} to topic {topic}. Is final batch: {is_final_batch}")
+    print(
+        f"Publishing {total_chunks} chunks for sequence {sequence_number} to topic {topic}. Is final batch: {is_final_batch}")
 
     for chunk_number, chunk_data in enumerate(chunks, start=1):
         # Determine if this is the final message - only true for the last chunk of the final batch
@@ -143,7 +285,8 @@ def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
                 qos=1,
                 payload=json.dumps(message)
             )
-            print(f"Published sequence {sequence_number}, chunk {chunk_number}/{total_chunks} (is_final_sequence: {is_final})")
+            print(
+                f"Published sequence {sequence_number}, chunk {chunk_number}/{total_chunks} (is_final_sequence: {is_final})")
             print(f"IoT publish response: {json.dumps(response, default=str)}")
 
             if is_final:
@@ -154,150 +297,6 @@ def publish_batch(iot_client: Any, topic: str, batch_data: bytes,
             raise
 
     print(f"Completed publishing sequence {sequence_number}.")
-
-
-def process_rows(rows: list, schema: pa.Schema) -> bytes:
-    """
-    Process a group of rows into an Arrow Stream IPC format.
-    """
-    record_batch = create_record_batch(rows, schema)
-    return serialize_arrow_batch(record_batch)
-
-
-def lambda_handler(event, context):
-    print("Received event:", json.dumps(event))
-
-    try:
-        # Extract parameters from the event
-        query = event['arguments']['query']
-        transfer_id = event['arguments'].get('transferId')
-
-        if not transfer_id:
-            print("No transfer ID provided, generating new one")
-            transfer_id = str(uuid.uuid4())
-
-        print(f"Using transfer ID: {transfer_id}")
-
-        row_limit = event['arguments'].get('rowLimit', DEFAULT_ROW_LIMIT)
-        batch_size = event['arguments'].get('batchSize', DEFAULT_BATCH_SIZE)
-
-        print(f"Starting query execution with transfer ID: {transfer_id}")
-        print(f"Query: {query}")
-        print(f"Row limit: {row_limit}, Batch size: {batch_size}")
-
-        if not is_query_safe(query):
-            raise Exception('Unsafe SQL query.')
-
-        query_with_limit = add_limit_if_needed(query, row_limit)
-
-        if db_pool is None:
-            raise Exception('Database connection pool is not initialized.')
-
-        # Add a small delay before starting query execution
-        time.sleep(1)
-        print("Starting query execution after delay...")
-
-        conn = db_pool.getconn()
-        cursor_name = f"cursor_{uuid.uuid4().hex}"
-        cursor = conn.cursor(name=cursor_name)
-        cursor.itersize = batch_size
-
-        print(f"Executing query with limit: {query_with_limit}")
-        cursor.execute(query_with_limit)
-
-        first_batch = cursor.fetchmany(batch_size)
-        if not first_batch:
-            print('No data returned from query.')
-            return {
-                'transferId': transfer_id,
-                'metadata': {
-                    'rowCount': 0,
-                    'chunkCount': 0,
-                    'schema': {}
-                }
-            }
-
-        column_names = [desc[0] for desc in cursor.description]
-        print(f"Column names: {column_names}")
-
-        table = pa.Table.from_arrays(
-            [pa.array([row[i] for row in first_batch]) for i in range(len(column_names))],
-            names=column_names
-        )
-        schema = table.schema
-        schema_info = {field.name: str(field.type) for field in schema}
-        print(f"Determined schema: {json.dumps(schema_info)}")
-
-        sequence_number = 1
-        row_count = len(first_batch)
-
-        print(f"Starting to process and publish rows for transfer ID: {transfer_id}")
-
-        # Process first batch
-        batch_data = process_rows(first_batch, schema)
-
-        # Check if this is the only batch we'll have
-        peek_next = cursor.fetchone()
-        is_final = peek_next is None or row_count >= row_limit
-        if peek_next:
-            cursor.scroll(-1)  # Move cursor back if we peeked a row
-
-        # Publish first batch with correct final flag
-        print(f"Publishing first batch. Is final: {is_final}")
-        publish_batch(iot_client, iot_topic, batch_data, transfer_id, sequence_number, is_final_batch=is_final)
-
-        if is_final:
-            print("Query complete - only one batch needed.")
-            return {
-                'transferId': transfer_id,
-                'metadata': {
-                    'rowCount': row_count,
-                    'chunkCount': 1,
-                    'schema': schema_info
-                }
-            }
-
-        # Fetch and process remaining batches
-        remaining_batches = list(stream_query_results(cursor, batch_size))
-        total_batches = len(remaining_batches)
-
-        for i, batch_rows in enumerate(remaining_batches):
-            sequence_number += 1
-            batch_row_count = len(batch_rows)
-            row_count += batch_row_count
-
-            print(f"Processing batch {sequence_number} with {batch_row_count} rows.")
-            batch_data = process_rows(batch_rows, schema)
-
-            # Check if this is the final batch
-            is_final = (i == total_batches - 1) or (row_count >= row_limit)
-            publish_batch(iot_client, iot_topic, batch_data, transfer_id, sequence_number, is_final_batch=is_final)
-
-            if row_count >= row_limit:
-                print(f"Row limit {row_limit} reached. Stopping query execution.")
-                break
-
-        print(f"Completed processing and publishing all rows. Total rows: {row_count}")
-
-        return {
-            'transferId': transfer_id,
-            'metadata': {
-                'rowCount': row_count,
-                'chunkCount': sequence_number,
-                'schema': schema_info
-            }
-        }
-
-    except Exception as e:
-        print(f"Error in lambda_handler: {str(e)}")
-        raise
-    finally:
-        if 'cursor' in locals():
-            cursor.close()
-            print("Database cursor closed.")
-        if 'conn' in locals():
-            db_pool.putconn(conn)
-            print("Database connection returned to pool.")
 
 
 def is_query_safe(query):
@@ -336,3 +335,164 @@ def add_limit_if_needed(query, row_limit=DEFAULT_ROW_LIMIT):
         return f"{query} LIMIT {row_limit}"
     print("LIMIT clause already present in query.")
     return query
+
+
+def process_rows(rows: list, schema: pa.Schema) -> bytes:
+    """
+    Process a group of rows into an Arrow Stream IPC format with error handling.
+    """
+    try:
+        record_batch = create_record_batch(rows, schema)
+        return serialize_arrow_batch(record_batch)
+    except Exception as e:
+        print(f"Error processing rows: {str(e)}")
+        if rows:
+            print("Sample row data:", rows[0])
+            print("Schema:")
+            for field in schema:
+                print(f"{field.name}: {field.type}")
+        raise
+
+
+def lambda_handler(event, context):
+    print("Received event:", json.dumps(event))
+    start_time = time.time()
+    conn = None
+    cursor = None
+
+    try:
+        arguments = event['arguments']
+        query = arguments['query']
+        transfer_id = arguments['transferId']
+        row_limit = arguments.get('rowLimit', DEFAULT_ROW_LIMIT)
+        batch_size = arguments.get('batchSize', DEFAULT_BATCH_SIZE)
+
+        print(f"Starting query execution with transfer ID: {transfer_id}")
+        print(f"Query: {query}")
+        print(f"Row limit: {row_limit}, Batch size: {batch_size}")
+
+        if not is_query_safe(query):
+            raise Exception('Unsafe SQL query.')
+
+        if db_pool is None:
+            raise Exception('Database connection pool is not initialized.')
+
+        conn = db_pool.getconn()
+        query_with_limit = add_limit_if_needed(query, row_limit)
+
+        cursor = conn.cursor()
+        cursor.execute(query_with_limit)
+
+        if cursor.description is None:
+            raise Exception("Query execution failed - no column description available")
+
+        # Create schema from the cursor description
+        fields = []
+        for desc in cursor.description:
+            name = desc[0]
+            # Map PostgreSQL types to Arrow types
+            if desc[1] == 1184:  # TIMESTAMPTZ
+                field_type = pa.timestamp('us', tz='UTC')
+            elif desc[1] == 701 or name == 'value_gpu':  # FLOAT8/DOUBLE
+                field_type = pa.float64()
+            elif desc[1] == 20:  # BIGINT
+                field_type = pa.int64()
+            elif desc[1] == 25:  # TEXT
+                field_type = pa.string()
+            else:
+                field_type = pa.string()  # Default to string for unknown types
+            fields.append(pa.field(name, field_type))
+
+        schema = pa.schema(fields)
+        schema_info = {field.name: str(field.type) for field in schema}
+        print(f"Created schema: {schema_info}")
+
+        # Try to fetch first batch with error handling
+        try:
+            first_batch = cursor.fetchmany(batch_size)
+            print(f"Fetched first batch size: {len(first_batch) if first_batch else 0}")
+        except Exception as e:
+            print(f"Error fetching data: {str(e)}")
+            raise Exception(f"Data fetch failed: {str(e)}")
+
+        if not first_batch:
+            print("Query returned no data")
+            return {
+                'transferId': transfer_id,
+                'metadata': {
+                    'rowCount': 0,
+                    'chunkCount': 0,
+                    'schema': schema_info
+                }
+            }
+
+        row_count = len(first_batch)
+        publisher = None
+
+        try:
+            publisher = BatchPublisher(iot_client, iot_topic, transfer_id)
+
+            # Process and publish first batch
+            batch_data = process_rows(first_batch, schema)
+            is_final = len(first_batch) < batch_size
+            publisher.publish(batch_data, is_final)
+
+            # Process remaining batches if any
+            while not is_final and row_count < row_limit:
+                if time.time() - start_time > 40:
+                    print(f"Time limit approaching. Stopping after {row_count} rows")
+                    is_final = True
+                    break
+
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    is_final = True
+                    break
+
+                current_batch_size = len(rows)
+                row_count += current_batch_size
+
+                batch_data = process_rows(rows, schema)
+                is_final = is_final or (row_count >= row_limit) or (current_batch_size < batch_size)
+                publisher.publish(batch_data, is_final)
+
+            if publisher:
+                publisher.wait_completion(timeout=5)
+
+            print(f"Query completed. Processed {row_count} rows")
+            return {
+                'transferId': transfer_id,
+                'metadata': {
+                    'rowCount': row_count,
+                    'chunkCount': publisher.sequence_number if publisher else 0,
+                    'schema': schema_info
+                }
+            }
+
+        finally:
+            if publisher:
+                try:
+                    publisher.wait_completion(timeout=1)
+                except Exception as e:
+                    print(f"Error during publisher cleanup: {str(e)}")
+
+    except Exception as e:
+        print(f"Error in lambda_handler: {str(e)}")
+        import traceback
+        print("Full traceback:")
+        print(traceback.format_exc())
+        raise
+    finally:
+        if cursor:
+            try:
+                cursor.close()
+                print("Cursor closed")
+            except Exception as e:
+                print(f"Error closing cursor: {e}")
+        if conn:
+            try:
+                db_pool.putconn(conn)
+                print("Connection returned to pool")
+            except Exception as e:
+                print(f"Error returning connection to pool: {e}")
+        print(f"Total execution time: {time.time() - start_time:.2f}s")
