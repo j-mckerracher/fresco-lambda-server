@@ -16,28 +16,23 @@ from queue import Queue, Empty
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from dataclasses import dataclass
-from collections import defaultdict
 
 # Optimized Constants
-MAX_MQTT_PAYLOAD_SIZE = 128 * 1024   # 128 KB (AWS IoT limit)
-MAX_DATA_SIZE = int(MAX_MQTT_PAYLOAD_SIZE * 0.7)  # Increased buffer size
-DEFAULT_BATCH_SIZE = 2000  # Increased from 1000
-DEFAULT_ROW_LIMIT = 1000000  # Increased to 1M rows
-MAX_TOTAL_TIME = 58  # Maximum total execution time
-MAX_PROCESSING_TIME = 45  # Increased processing window
-MAX_PUBLISHING_TIME = 10  # Optimized publishing window
-MAX_CLEANUP_TIME = 3
-MAX_PUBLISHER_THREADS = 12  # Doubled from 6
-COMPRESSION_LEVEL = 4  # Fast compression
-PARALLEL_QUERIES = 4  # Number of parallel query executors
-MAX_MEMORY_THRESHOLD = 2400
-QUEUE_SIZE = min(100, int(psutil.virtual_memory().available / (1024 * 1024 * 10)))  # 10MB per queued item
+MAX_MQTT_PAYLOAD_SIZE = 128 * 1024
+MAX_DATA_SIZE = int(MAX_MQTT_PAYLOAD_SIZE * 0.9)
+DEFAULT_BATCH_SIZE = 5000
+DEFAULT_ROW_LIMIT = 1000000
+MAX_PUBLISHER_THREADS = 8
+COMPRESSION_LEVEL = 1
+PARALLEL_QUERIES = 8
+QUEUE_SIZE = 50
+MAX_EXECUTION_TIME = 55  # Leave buffer for cleanup
 
-# Initialize the PostgreSQL connection pool with more connections
+# Initialize the PostgreSQL connection pool
 try:
     db_pool = psycopg2.pool.ThreadedConnectionPool(
         minconn=10,
-        maxconn=30,  # Increased pool size
+        maxconn=30,
         user=os.environ['DB_USER'],
         password=os.environ['DB_PASSWORD'],
         host=os.environ['DB_HOST'],
@@ -69,39 +64,67 @@ class QueryPartition:
     batch_size: int
 
 
-@contextmanager
-def get_db_connection():
-    conn = None
-    try:
-        conn = db_pool.getconn()
-        yield conn
-    finally:
-        if conn:
-            db_pool.putconn(conn)
-
-
-def check_memory():
-    usage = psutil.Process().memory_info().rss / (1024 * 1024)
-    if usage > MAX_MEMORY_THRESHOLD:
-        raise MemoryError(f"Memory usage ({usage}MB) exceeded threshold")
-
-
-def create_response(status, transfer_id, row_count=0, chunk_count=0, schema_info=None, time_elapsed=0, total_rows=0, published_messages=0, error=None):
-    """Create a standardized response object for the Lambda function"""
+def create_response(
+        transfer_id: str,
+        row_count: int = 0,
+        chunk_count: int = 0,
+        schema_info: Dict = None,
+        time_elapsed: float = 0,
+        total_rows: int = 0,
+        published_messages: int = 0,
+        status: str = "COMPLETED",
+        error: str = None
+) -> Dict[str, Any]:
+    """Create response matching AppSync schema"""
     return {
-        'transferId': transfer_id,
-        'metadata': {
-            'rowCount': int(row_count),
-            'chunkCount': int(chunk_count),
-            'schema': schema_info,
-            'isComplete': status == "COMPLETED",
-            'timeElapsed': int(time_elapsed),  # Convert to integer
-            'totalRows': int(total_rows),
-            'publishedMessageCount': int(published_messages),
-            'processingStatus': status,
-            'error': str(error) if error else None
+        "transferId": transfer_id,
+        "metadata": {
+            "rowCount": row_count,
+            "chunkCount": chunk_count,
+            "schema": json.dumps(schema_info) if schema_info else None,
+            "isComplete": status == "COMPLETED",
+            "timeElapsed": time_elapsed,
+            "totalRows": total_rows,
+            "publishedMessageCount": published_messages,
+            "processingStatus": status,
+            "error": error
         }
     }
+
+
+async def get_schema(query: str) -> Tuple[pa.Schema, Dict]:
+    """Get Arrow schema and schema info dict"""
+    async with db_pool.getconn() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SET work_mem = '256MB'")
+            cursor.execute(f"SELECT * FROM ({query}) t LIMIT 0")
+
+            fields = []
+            schema_info = {}
+
+            for desc in cursor.description:
+                name = desc[0]
+                pg_type = desc[1]
+
+                if pg_type in (1184, 1114):  # TIMESTAMPTZ or TIMESTAMP
+                    field_type = pa.timestamp('us', tz='UTC')
+                    schema_info[name] = "timestamp"
+                elif pg_type == 701 or name == 'value_gpu':  # FLOAT8
+                    field_type = pa.float64()
+                    schema_info[name] = "float"
+                elif pg_type == 20:  # BIGINT
+                    field_type = pa.int64()
+                    schema_info[name] = "integer"
+                elif pg_type == 23:  # INTEGER
+                    field_type = pa.int32()
+                    schema_info[name] = "integer"
+                else:
+                    field_type = pa.string()
+                    schema_info[name] = "string"
+
+                fields.append(pa.field(name, field_type))
+
+    return pa.schema(fields), schema_info
 
 
 class OptimizedBatchProcessor:
@@ -110,193 +133,51 @@ class OptimizedBatchProcessor:
         self.field_converters = self._create_field_converters()
 
     def _create_field_converters(self):
-        def make_float_converter():
-            def converter(x):
-                if x is None:
-                    return 0.0
-                # Handle both string and numeric inputs
-                try:
-                    return float(x)
-                except (TypeError, ValueError):
-                    return 0.0
-            return converter
-
-        def make_int_converter():
-            def converter(x):
-                if x is None:
-                    return 0
-                try:
-                    return int(x)
-                except (TypeError, ValueError):
-                    return 0
-            return converter
-
-        def make_str_converter():
-            def converter(x):
-                return '' if x is None else str(x)
-            return converter
-
-        def make_datetime_converter():
-            def converter(x):
-                # Pass datetime objects directly to Arrow
-                # Arrow will handle the conversion internally
-                return x
-            return converter
-
         converters = []
         for field in self.schema:
             if pa.types.is_timestamp(field.type):
-                converters.append(make_datetime_converter())
+                converters.append(lambda x: x)
             elif field.name == 'value_gpu' or pa.types.is_floating(field.type):
-                converters.append(make_float_converter())
+                converters.append(lambda x: float(x) if x is not None else 0.0)
             elif pa.types.is_integer(field.type):
-                converters.append(make_int_converter())
+                converters.append(lambda x: int(x) if x is not None else 0)
             else:
-                converters.append(make_str_converter())
+                converters.append(lambda x: str(x) if x is not None else '')
         return converters
 
     def process_batch(self, rows: list) -> bytes:
-        try:
-            check_memory()
-            # Pre-allocate arrays for each column
-            arrays = [[] for _ in range(len(self.schema))]
+        arrays = [[] for _ in range(len(self.schema))]
 
-            # Single-pass row processing with optimized conversion
-            for row in rows:
-                for i, (value, converter) in enumerate(zip(row, self.field_converters)):
-                    arrays[i].append(converter(value))
+        for row in rows:
+            for i, (value, converter) in enumerate(zip(row, self.field_converters)):
+                arrays[i].append(converter(value))
 
-            # Bulk conversion to Arrow arrays
-            arrow_arrays = [
-                pa.array(column_data, type=field.type)
-                for column_data, field in zip(arrays, self.schema)
-            ]
+        arrow_arrays = [pa.array(col, type=field.type)
+                        for col, field in zip(arrays, self.schema)]
 
-            # Create record batch and serialize
-            record_batch = pa.RecordBatch.from_arrays(arrow_arrays, schema=self.schema)
-            sink = pa.BufferOutputStream()
-            with ipc.new_stream(sink, record_batch.schema) as writer:
-                writer.write_batch(record_batch)
+        record_batch = pa.RecordBatch.from_arrays(arrow_arrays, schema=self.schema)
+        sink = pa.BufferOutputStream()
+        with ipc.new_stream(sink, record_batch.schema) as writer:
+            writer.write_batch(record_batch)
 
-            # Compress the data
-            data = sink.getvalue().to_pybytes()
-            compressed_data = zlib.compress(data, level=COMPRESSION_LEVEL)
-            return compressed_data
-
-        except Exception as e:
-            print(f"Error processing batch: {str(e)}")
-            raise
+        return zlib.compress(sink.getvalue().to_pybytes(), level=COMPRESSION_LEVEL)
 
 
-class EnhancedParallelPublisher:
-    def __init__(self, iot_client, topic, transfer_id, num_threads=MAX_PUBLISHER_THREADS):
+class FastParallelPublisher:
+    def __init__(self, iot_client, topic: str, transfer_id: str):
         self.iot_client = iot_client
         self.topic = topic
         self.transfer_id = transfer_id
-        self.max_chunk_size = MAX_DATA_SIZE
         self.sequence_number = 0
         self.sequence_lock = threading.Lock()
         self.publish_queue = Queue(maxsize=QUEUE_SIZE)
-        self.error = None
-        self.is_running = True
-        self.executor = ThreadPoolExecutor(max_workers=num_threads)
-        self.futures = []
+        self.executor = ThreadPoolExecutor(max_workers=MAX_PUBLISHER_THREADS)
         self.publish_count = 0
-        self.publish_count_lock = threading.Lock()
-        self.batch_timestamps = defaultdict(float)
+        self.is_running = True
+        self.error = None
 
-        # Start publisher threads
-        for _ in range(num_threads):
-            future = self.executor.submit(self._publish_worker)
-            self.futures.append(future)
-
-        print(f"EnhancedParallelPublisher initialized with {num_threads} threads")
-
-    def get_next_sequence(self):
-        with self.sequence_lock:
-            self.sequence_number += 1
-            return self.sequence_number
-
-    def _chunk_data(self, data: bytes) -> List[bytes]:
-        """Split data into chunks that will fit within IoT payload limits after encoding"""
-        chunks = []
-        chunk_size = MAX_DATA_SIZE
-
-        for i in range(0, len(data), chunk_size):
-            chunk = data[i:i + chunk_size]
-            # Estimate final message size including metadata and base64 encoding
-            encoded_size = len(base64.b64encode(chunk)) + 500  # 500 bytes buffer for metadata
-
-            # If estimated size is too large, reduce chunk size and try again
-            while encoded_size > MAX_MQTT_PAYLOAD_SIZE and chunk_size > 1024:
-                chunk_size = int(chunk_size * 0.8)  # Reduce by 20%
-                chunk = data[i:i + chunk_size]
-                encoded_size = len(base64.b64encode(chunk)) + 500
-
-            chunks.append(chunk)
-
-        return chunks
-
-    def _publish_batch(self, batch_item: Tuple[bytes, bool, int]):
-        batch_data, is_final, partition_id = batch_item
-        sequence = self.get_next_sequence()
-
-        # Split data into appropriately sized chunks
-        chunks = self._chunk_data(batch_data)
-        total_chunks = len(chunks)
-
-        for chunk_number, chunk_data in enumerate(chunks, start=1):
-            is_final_sequence = is_final and (chunk_number == total_chunks)
-
-            # Calculate actual message size for logging
-            encoded_data = base64.b64encode(chunk_data).decode('utf-8')
-
-            message = {
-                'type': 'arrow_data',
-                'metadata': {
-                    'transfer_id': self.transfer_id,
-                    'sequence_number': sequence,
-                    'chunk_number': chunk_number,
-                    'total_chunks': total_chunks,
-                    'chunk_size': len(chunk_data),
-                    'format': 'arrow_stream_ipc_compressed',
-                    'compression': 'zlib',
-                    'compression_level': COMPRESSION_LEVEL,
-                    'partition_id': partition_id,
-                    'timestamp': int(time.time() * 1000),
-                    'is_final_sequence': is_final_sequence
-                },
-                'data': encoded_data
-            }
-
-            message_json = json.dumps(message)
-            message_size = len(message_json.encode('utf-8'))
-
-            if message_size > MAX_MQTT_PAYLOAD_SIZE:
-                print(f"Warning: Message size ({message_size} bytes) exceeds limit after chunking")
-                continue
-
-            # Implement exponential backoff for publishing
-            max_retries = 3
-            retry_delay = 0.1
-
-            for attempt in range(max_retries):
-                try:
-                    self.iot_client.publish(
-                        topic=self.topic,
-                        qos=1,
-                        payload=message_json
-                    )
-                    with self.publish_count_lock:
-                        self.publish_count += 1
-                    break
-                except Exception as e:
-                    if "RequestEntityTooLargeException" in str(e):
-                        print(f"Message size too large ({message_size} bytes), skipping chunk")
-                        break
-                    if attempt == max_retries - 1:
-                        raise e
-                    time.sleep(retry_delay * (2 ** attempt))
+        self.futures = [self.executor.submit(self._publish_worker)
+                        for _ in range(MAX_PUBLISHER_THREADS)]
 
     def _publish_worker(self):
         while self.is_running:
@@ -305,7 +186,36 @@ class EnhancedParallelPublisher:
                 if batch_item is None:
                     break
 
-                self._publish_batch(batch_item)
+                data, is_final, partition_id = batch_item
+                sequence = self._get_next_sequence()
+
+                message = {
+                    'type': 'arrow_data',
+                    'metadata': {
+                        'transfer_id': self.transfer_id,
+                        'sequence': sequence,
+                        'partition': partition_id,
+                        'final': is_final,
+                        'timestamp': int(time.time() * 1000)
+                    },
+                    'data': base64.b64encode(data).decode('utf-8')
+                }
+
+                for attempt in range(2):
+                    try:
+                        self.iot_client.publish(
+                            topic=self.topic,
+                            qos=1,
+                            payload=json.dumps(message)
+                        )
+                        self.publish_count += 1
+                        break
+                    except Exception as e:
+                        if attempt == 1:
+                            self.error = e
+                            self.is_running = False
+                        time.sleep(0.1)
+
                 self.publish_queue.task_done()
 
             except Empty:
@@ -315,326 +225,199 @@ class EnhancedParallelPublisher:
                 self.is_running = False
                 break
 
-    def publish(self, batch_data: bytes, is_final: bool = False, partition_id: int = 0):
+    def _get_next_sequence(self):
+        with self.sequence_lock:
+            self.sequence_number += 1
+            return self.sequence_number
+
+    def publish(self, data: bytes, is_final: bool = False, partition_id: int = 0):
+        if not self.is_running:
+            raise self.error if self.error else Exception("Publisher stopped")
+        self.publish_queue.put((data, is_final, partition_id))
+
+    def wait_completion(self):
+        self.is_running = False
+        for _ in range(MAX_PUBLISHER_THREADS):
+            self.publish_queue.put(None)
+        self.executor.shutdown(wait=True)
         if self.error:
             raise self.error
-        self.publish_queue.put((batch_data, is_final, partition_id))
-
-    def wait_completion(self, timeout=None):
-        try:
-            wait_start = time.time()
-
-            # Process remaining queue items
-            while not self.publish_queue.empty():
-                if timeout and time.time() - wait_start > timeout:
-                    break
-                time.sleep(0.1)
-
-            # Signal threads to stop
-            self.is_running = False
-            for _ in range(len(self.futures)):
-                self.publish_queue.put(None)
-
-            # Wait for executor shutdown
-            self.executor.shutdown(wait=True)
-
-            if self.error:
-                raise self.error
-
-            return self.publish_count
-
-        except Exception as e:
-            print(f"Error during publisher shutdown: {str(e)}")
-            raise
-        finally:
-            if not self.executor._shutdown:
-                self.executor.shutdown(wait=False)
+        return self.publish_count
 
 
-class ParallelQueryExecutor:
-    def __init__(self, base_query: str, schema: pa.Schema, num_partitions: int = PARALLEL_QUERIES):
-        self.base_query = base_query
-        self.schema = schema
-        self.num_partitions = num_partitions
-        self.batch_processor = OptimizedBatchProcessor(schema)
-
-    def create_partition_query(self, partition: QueryPartition) -> str:
-        return f"""
-        WITH numbered_rows AS (
-            SELECT ROW_NUMBER() OVER () as rn, t.*
-            FROM ({self.base_query}) t
-        )
-        SELECT * FROM numbered_rows 
-        WHERE rn > {partition.start_offset} AND rn <= {partition.end_offset}
-        """
-
-
-def is_query_safe(query):
-    """Validates the SQL query for safety"""
-    print("Validating SQL query for safety.")
-    disallowed_keywords = [
-        'INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE',
-        'TRUNCATE', 'EXECUTE', 'GRANT', 'REVOKE', 'REPLACE'
-    ]
-    parsed = sqlparse.parse(query)
-    if not parsed:
-        print("Failed to parse SQL query.")
-        return False
-
-    tokens = [token for token in parsed[0].flatten()]
-    token_values = [token.value.upper() for token in tokens if not token.is_whitespace]
-
-    for keyword in disallowed_keywords:
-        if keyword.upper() in token_values:
-            print(f"Disallowed keyword '{keyword}' found in query.")
-            return False
-
-    if ';' in query:
-        print("Semicolon detected in query.")
-        return False
-
-    print("SQL query is considered safe.")
-    return True
-
-
-def lambda_handler(event, context):
-    """Synchronous wrapper for async _lambda_handler"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+@contextmanager
+def get_db_connection():
+    """Get database connection from pool"""
+    conn = None
     try:
-        return loop.run_until_complete(_lambda_handler(event, context))
+        conn = db_pool.getconn()
+        yield conn
     finally:
-        try:
-            loop.close()
-        except Exception as e:
-            print(f"Error closing event loop: {e}")
+        if conn:
+            db_pool.putconn(conn)
+
+async def get_schema(query: str) -> Tuple[pa.Schema, Dict]:
+    """Get Arrow schema and schema info dict"""
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SET work_mem = '256MB'")
+            cursor.execute(f"SELECT * FROM ({query}) t LIMIT 0")
+
+            fields = []
+            schema_info = {}
+
+            for desc in cursor.description:
+                name = desc[0]
+                pg_type = desc[1]
+
+                if pg_type in (1184, 1114):  # TIMESTAMPTZ or TIMESTAMP
+                    field_type = pa.timestamp('us', tz='UTC')
+                    schema_info[name] = "timestamp"
+                elif pg_type == 701 or name == 'value_gpu':  # FLOAT8
+                    field_type = pa.float64()
+                    schema_info[name] = "float"
+                elif pg_type == 20:  # BIGINT
+                    field_type = pa.int64()
+                    schema_info[name] = "integer"
+                elif pg_type == 23:  # INTEGER
+                    field_type = pa.int32()
+                    schema_info[name] = "integer"
+                else:
+                    field_type = pa.string()
+                    schema_info[name] = "string"
+
+                fields.append(pa.field(name, field_type))
+
+    return pa.schema(fields), schema_info
+
+async def process_partition(partition: QueryPartition, publisher: FastParallelPublisher,
+                          batch_processor: OptimizedBatchProcessor) -> int:
+    rows_processed = 0
+
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(f"""
+                SELECT * FROM ({partition.query}) t 
+                OFFSET {partition.start_offset} 
+                LIMIT {partition.end_offset - partition.start_offset}
+            """)
+
+            while True:
+                rows = cursor.fetchmany(partition.batch_size)
+                if not rows:
+                    break
+
+                batch_data = batch_processor.process_batch(rows)
+                is_final = len(rows) < partition.batch_size
+                publisher.publish(batch_data, is_final, partition.start_offset)
+                rows_processed += len(rows)
+
+    return rows_processed
 
 
 async def _lambda_handler(event, context):
-    """
-    Optimized Lambda handler for high-throughput data streaming
-    """
-    print("Received event:", json.dumps(event))
     start_time = time.time()
     publisher = None
-    schema_info = None
-    processing_status = "ERROR"
-    total_rows_processed = 0
+    total_rows = 0
     transfer_id = None
+    schema_info = None
 
     try:
-        # Extract arguments
-        arguments = event['arguments']
-        transfer_id = arguments['transferId']
-        query = arguments['query']
-        row_limit = min(arguments.get('rowLimit', DEFAULT_ROW_LIMIT), DEFAULT_ROW_LIMIT)  # Enforce maximum limit
-        batch_size = min(arguments.get('batchSize', DEFAULT_BATCH_SIZE), 5000)  # Cap batch size
+        args = event['arguments']
+        transfer_id = args['transferId']
+        query = args['query']
+        row_limit = min(args.get('rowLimit', DEFAULT_ROW_LIMIT), DEFAULT_ROW_LIMIT)
+        batch_size = min(args.get('batchSize', DEFAULT_BATCH_SIZE), DEFAULT_BATCH_SIZE)
 
-        print(f"Starting parallel query execution with transfer ID: {transfer_id}")
-        print(f"Query: {query}")
-        print(f"Row limit: {row_limit}, Batch size: {batch_size}")
+        print(f"Starting query execution with transfer ID: {transfer_id}")
+        print(f"Configuration - Row limit: {row_limit}, Batch size: {batch_size}")
 
-        # Validate query
-        if not is_query_safe(query):
-            raise Exception('Unsafe SQL query.')
+        # Validate execution time
+        if context and hasattr(context, 'get_remaining_time_in_millis'):
+            remaining_time = context.get_remaining_time_in_millis() / 1000
+            if remaining_time < MAX_EXECUTION_TIME:
+                raise Exception(f"Insufficient execution time: {remaining_time}s < {MAX_EXECUTION_TIME}s")
 
-        if db_pool is None:
-            raise Exception('Database connection pool is not initialized.')
-
-        # Modify the base query to include the row limit
-        limited_query = f"""
-        WITH limited_results AS (
-            SELECT * FROM ({query}) base_query
-            LIMIT {row_limit}
-        )
-        SELECT * FROM limited_results
-        """
-
-        # Get initial schema and row count
-        conn = db_pool.getconn()
-        try:
-            with conn.cursor() as cursor:
-                # Set optimized query parameters
-                cursor.execute("""
-                    SET work_mem = '256MB';
-                    SET maintenance_work_mem = '256MB';
-                    SET random_page_cost = 1.0;
-                    SET effective_cache_size = '4GB';
-                """)
-
-                # Get schema
-                cursor.execute(f"SELECT * FROM ({limited_query}) t LIMIT 0")
-                if cursor.description is None:
-                    return create_response(
-                        status="COMPLETED",
-                        transfer_id=transfer_id,
-                        row_count=0,
-                        chunk_count=0,
-                        schema_info={},
-                        time_elapsed=time.time() - start_time
-                    )
-
-                # Create schema
-                fields = []
-                for desc in cursor.description:
-                    name = desc[0]
-                    if desc[1] == 1184 or desc[1] == 1114:  # TIMESTAMPTZ or TIMESTAMP
-                        field_type = pa.timestamp('us', tz='UTC')
-                    elif desc[1] == 701 or name == 'value_gpu':  # FLOAT8/DOUBLE
-                        field_type = pa.float64()
-                    elif desc[1] == 20:  # BIGINT
-                        field_type = pa.int64()
-                    elif desc[1] == 25:  # TEXT
-                        field_type = pa.string()
-                    else:
-                        field_type = pa.string()
-                    fields.append(pa.field(name, field_type))
-
-                schema = pa.schema(fields)
-                schema_info = {field.name: str(field.type) for field in schema}
-
-                # Get approximate row count for the limited query
-                cursor.execute(f"EXPLAIN (FORMAT JSON) {limited_query}")
-                plan = cursor.fetchone()[0]
-                estimated_rows = min(plan[0]['Plan']['Plan Rows'], row_limit)
-
-        finally:
-            db_pool.putconn(conn)
-
-        # Calculate partition sizes based on row_limit
-        rows_per_partition = max(1000, min(estimated_rows, row_limit) // PARALLEL_QUERIES)
-        partitions = []
-        remaining_rows = row_limit
-        offset = 0
-
-        # Create partitions that respect the row limit
-        while remaining_rows > 0 and len(partitions) < PARALLEL_QUERIES:
-            partition_size = min(rows_per_partition, remaining_rows)
-            partitions.append(QueryPartition(
-                start_offset=offset,
-                end_offset=offset + partition_size,
-                query=limited_query,  # Use the query with LIMIT clause
-                batch_size=batch_size
-            ))
-            offset += partition_size
-            remaining_rows -= partition_size
-
-        # Initialize parallel processing components
-        publisher = EnhancedParallelPublisher(iot_client, iot_topic, transfer_id)
+        # Get schema and initialize components
+        schema, schema_info = await get_schema(query)
+        publisher = FastParallelPublisher(iot_client, iot_topic, transfer_id)
         batch_processor = OptimizedBatchProcessor(schema)
 
-        # Execute partitions in parallel
-        tasks = []
-        for partition in partitions:
-            task = asyncio.create_task(process_partition(
-                partition,
-                publisher,
-                batch_processor
-            ))
-            tasks.append(task)
+        # Create and process partitions
+        partitions = [QueryPartition(
+            start_offset=i * (row_limit // PARALLEL_QUERIES),
+            end_offset=min((i + 1) * (row_limit // PARALLEL_QUERIES), row_limit),
+            query=query,
+            batch_size=batch_size
+        ) for i in range(PARALLEL_QUERIES)]
 
-        # Wait for all partitions to complete
+        tasks = [process_partition(p, publisher, batch_processor) for p in partitions]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Process results and handle any errors
-        partition_errors = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"Error in partition {i}: {str(result)}")
-                partition_errors.append(result)
-            else:
-                total_rows_processed += result
+        # Handle results
+        errors = [r for r in results if isinstance(r, Exception)]
+        successful_results = [r for r in results if isinstance(r, int)]
+        total_rows = sum(successful_results)
 
-        if partition_errors and total_rows_processed == 0:
-            raise partition_errors[0]
-
-        processing_status = "COMPLETED" if total_rows_processed > 0 else "PARTIAL"
-        if total_rows_processed >= row_limit:
-            processing_status = "COMPLETED"
-
+        # Detailed processing results
         execution_time = time.time() - start_time
-        print(f"Query execution completed in {execution_time:.2f}s. "
-              f"Processed {total_rows_processed:,} rows.")
+        rows_per_second = int(total_rows / execution_time) if execution_time > 0 else 0
+        print(f"\nProcessing Results:")
+        print(f"✓ Total rows processed: {total_rows:,}")
+        print(f"✓ Processing time: {execution_time:.2f} seconds")
+        print(f"✓ Processing rate: {rows_per_second:,} rows/second")
+        print(f"✓ Published messages: {publisher.publish_count if publisher else 0}")
+        if errors:
+            print(f"⚠ Errors encountered: {len(errors)}")
+            for i, error in enumerate(errors, 1):
+                print(f"  Error {i}: {str(error)}")
+
+        if errors and total_rows == 0:
+            raise errors[0]
+
+        status = "COMPLETED" if total_rows > 0 and not errors else "PARTIAL"
+        published_messages = publisher.publish_count if publisher else 0
 
         return create_response(
-            status=processing_status,
             transfer_id=transfer_id,
-            row_count=total_rows_processed,
+            row_count=total_rows,
             chunk_count=publisher.sequence_number if publisher else 0,
             schema_info=schema_info,
             time_elapsed=execution_time,
-            total_rows=total_rows_processed,
-            published_messages=publisher.publish_count if publisher else 0
+            total_rows=total_rows,
+            published_messages=published_messages,
+            status=status
         )
 
     except Exception as e:
-        print(f"Error during execution: {str(e)}")
+        error_message = str(e)
+        error_type = "TIMEOUT_ERROR" if "timeout" in error_message.lower() else "ERROR"
+
+        execution_time = time.time() - start_time
+        print(f"\nError occurred after {execution_time:.2f} seconds:")
+        print(f"✗ Error type: {error_type}")
+        print(f"✗ Error message: {error_message}")
+        print(f"✗ Rows processed before error: {total_rows:,}")
+
         return create_response(
-            status="ERROR",
             transfer_id=transfer_id,
-            row_count=total_rows_processed,
+            row_count=total_rows,
             chunk_count=publisher.sequence_number if publisher else 0,
             schema_info=schema_info,
-            time_elapsed=time.time() - start_time,
-            total_rows=total_rows_processed,
+            time_elapsed=execution_time,
+            total_rows=total_rows,
             published_messages=publisher.publish_count if publisher else 0,
-            error=str(e)
+            status=error_type,
+            error=error_message
         )
 
     finally:
         if publisher:
             try:
-                cleanup_time = min(MAX_CLEANUP_TIME,
-                                   MAX_TOTAL_TIME - (time.time() - start_time))
-                if cleanup_time > 0:
-                    publisher.wait_completion(timeout=cleanup_time)
+                publisher.wait_completion()
             except Exception as e:
                 print(f"Error during publisher cleanup: {str(e)}")
 
 
-async def process_partition(partition, publisher, batch_processor):
-    """Helper function to process a single partition"""
-    rows_processed = 0
-    max_rows = partition.end_offset - partition.start_offset
-
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            try:
-                # Optimize connection for this partition
-                cursor.execute("""
-                    SET work_mem = '256MB';
-                    SET enable_parallel_hash = on;
-                    SET enable_partitionwise_join = on;
-                    SET random_page_cost = 1.0;
-                """)
-
-                # Execute partitioned query with explicit LIMIT
-                partition_query = f"""
-                WITH numbered_rows AS (
-                    SELECT ROW_NUMBER() OVER () as rn, t.*
-                    FROM ({partition.query}) t
-                )
-                SELECT * FROM numbered_rows 
-                WHERE rn > {partition.start_offset} AND rn <= {partition.end_offset}
-                LIMIT {max_rows}  -- Explicit limit for this partition
-                """
-                cursor.execute(partition_query)
-
-                while rows_processed < max_rows:
-                    check_memory()
-                    rows = cursor.fetchmany(min(partition.batch_size, max_rows - rows_processed))
-                    if not rows:
-                        break
-
-                    batch_data = batch_processor.process_batch(rows)
-                    check_memory()
-                    is_final = len(rows) < partition.batch_size or rows_processed + len(rows) >= max_rows
-                    publisher.publish(batch_data, is_final, partition.start_offset)
-
-                    rows_processed += len(rows)
-
-                return rows_processed
-
-            except Exception as e:
-                print(f"Error processing partition: {str(e)}")
-                raise
+def lambda_handler(event, context):
+    return asyncio.run(_lambda_handler(event, context))
