@@ -18,7 +18,7 @@ from dataclasses import dataclass
 # Update these constants for better performance
 MAX_MQTT_PAYLOAD_SIZE = 128 * 1024
 MAX_DATA_SIZE = int(MAX_MQTT_PAYLOAD_SIZE * 0.9)
-DEFAULT_BATCH_SIZE = 10000  # Increased from 5000 to reduce number of batches
+DEFAULT_BATCH_SIZE = 5000
 DEFAULT_ROW_LIMIT = 1000000
 MAX_PUBLISHER_THREADS = 10  # Increased from 8 to handle more concurrent publishes
 COMPRESSION_LEVEL = 1
@@ -193,9 +193,42 @@ class FastParallelPublisher:
         self.publish_count = 0
         self.is_running = True
         self.error = None
-
+        # Reduce maximum data size to account for base64 encoding overhead (4/3 ratio)
+        # and leave room for metadata and JSON structure
+        self.max_chunk_size = int((MAX_MQTT_PAYLOAD_SIZE * 0.6) - 2048)  # ~75KB for data
         self.futures = [self.executor.submit(self._publish_worker)
                         for _ in range(MAX_PUBLISHER_THREADS)]
+
+    def _estimate_message_size(self, data: bytes, metadata: dict) -> int:
+        """Estimate final message size including base64 encoding and JSON structure"""
+        # Base64 encoding increases size by approximately 4/3
+        encoded_size = len(data) * 4 // 3
+        # Add estimated metadata and JSON structure overhead
+        metadata_size = len(json.dumps(metadata))
+        return encoded_size + metadata_size + 100  # Extra buffer for JSON formatting
+
+    def _chunk_data(self, data: bytes) -> list:
+        """Split data into appropriately sized chunks"""
+        chunks = []
+        for i in range(0, len(data), self.max_chunk_size):
+            chunk = data[i:i + self.max_chunk_size]
+            # Create test metadata to verify size
+            test_metadata = {
+                'transfer_id': self.transfer_id,
+                'sequence': 0,
+                'partition': 0,
+                'chunk_index': 0,
+                'total_chunks': 1,
+                'final': False,
+                'timestamp': int(time.time() * 1000)
+            }
+
+            # If estimated size is too large, reduce chunk size and retry
+            while self._estimate_message_size(chunk, test_metadata) >= MAX_MQTT_PAYLOAD_SIZE:
+                chunk = chunk[:int(len(chunk) * 0.8)]  # Reduce by 20%
+
+            chunks.append(chunk)
+        return chunks
 
     def _publish_worker(self):
         while self.is_running:
@@ -205,40 +238,55 @@ class FastParallelPublisher:
                     break
 
                 data, is_final, partition_id = batch_item
-                sequence = self._get_next_sequence()
+                chunks = self._chunk_data(data)
+                total_chunks = len(chunks)
 
-                message = {
-                    'type': 'arrow_data',
-                    'metadata': {
+                for chunk_index, chunk in enumerate(chunks):
+                    sequence = self._get_next_sequence()
+
+                    metadata = {
                         'transfer_id': self.transfer_id,
                         'sequence': sequence,
                         'partition': partition_id,
-                        'final': is_final,
+                        'chunk_index': chunk_index,
+                        'total_chunks': total_chunks,
+                        'final': is_final and chunk_index == total_chunks - 1,
                         'timestamp': int(time.time() * 1000)
-                    },
-                    'data': base64.b64encode(data).decode('utf-8')
-                }
+                    }
 
-                for attempt in range(2):
-                    try:
-                        self.iot_client.publish(
-                            topic=self.topic,
-                            qos=1,
-                            payload=json.dumps(message)
-                        )
-                        self.publish_count += 1
-                        break
-                    except Exception as e:
-                        if attempt == 1:
-                            self.error = e
-                            self.is_running = False
-                        time.sleep(0.1)
+                    message = {
+                        'type': 'arrow_data',
+                        'metadata': metadata,
+                        'data': base64.b64encode(chunk).decode('utf-8')
+                    }
+
+                    for attempt in range(3):
+                        try:
+                            payload = json.dumps(message)
+                            if len(payload.encode('utf-8')) > MAX_MQTT_PAYLOAD_SIZE:
+                                raise Exception(f"Payload size exceeds limit even after chunking")
+
+                            self.iot_client.publish(
+                                topic=self.topic,
+                                qos=1,
+                                payload=payload
+                            )
+                            self.publish_count += 1
+                            break
+                        except Exception as e:
+                            if attempt == 2:
+                                print(f"Failed to publish after {attempt + 1} attempts: {str(e)}")
+                                self.error = e
+                                self.is_running = False
+                                raise
+                            time.sleep(0.5 * (attempt + 1))
 
                 self.publish_queue.task_done()
 
             except Empty:
                 continue
             except Exception as e:
+                print(f"Publisher worker error: {str(e)}")
                 self.error = e
                 self.is_running = False
                 break
