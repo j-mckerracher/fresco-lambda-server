@@ -1,15 +1,13 @@
 import json
 import os
 from contextlib import contextmanager
-import psutil
 import psycopg2.pool
-import sqlparse
 import pyarrow as pa
 import pyarrow.ipc as ipc
 import boto3
 import base64
 import zlib
-from typing import List, Tuple, Dict, Any
+from typing import Tuple, Dict, Any
 import time
 import threading
 from queue import Queue, Empty
@@ -17,16 +15,16 @@ from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from dataclasses import dataclass
 
-# Optimized Constants
+# Update these constants for better performance
 MAX_MQTT_PAYLOAD_SIZE = 128 * 1024
 MAX_DATA_SIZE = int(MAX_MQTT_PAYLOAD_SIZE * 0.9)
-DEFAULT_BATCH_SIZE = 5000
+DEFAULT_BATCH_SIZE = 10000  # Increased from 5000 to reduce number of batches
 DEFAULT_ROW_LIMIT = 1000000
-MAX_PUBLISHER_THREADS = 8
+MAX_PUBLISHER_THREADS = 10  # Increased from 8 to handle more concurrent publishes
 COMPRESSION_LEVEL = 1
-PARALLEL_QUERIES = 8
-QUEUE_SIZE = 50
-MAX_EXECUTION_TIME = 55  # Leave buffer for cleanup
+PARALLEL_QUERIES = 12  # Increased from 8 to process more data in parallel
+QUEUE_SIZE = 100  # Increased queue size for better buffering
+MAX_EXECUTION_TIME = 55
 
 # Initialize the PostgreSQL connection pool
 try:
@@ -131,30 +129,50 @@ class OptimizedBatchProcessor:
     def __init__(self, schema: pa.Schema):
         self.schema = schema
         self.field_converters = self._create_field_converters()
+        # Pre-allocate list for better memory efficiency
+        self.arrays = [[] for _ in range(len(self.schema))]
 
     def _create_field_converters(self):
+        # Create closure for each type only once
+        def make_timestamp_converter():
+            return lambda x: x
+
+        def make_float_converter():
+            return lambda x: float(x) if x is not None else 0.0
+
+        def make_int_converter():
+            return lambda x: int(x) if x is not None else 0
+
+        def make_str_converter():
+            return lambda x: str(x) if x is not None else ''
+
         converters = []
         for field in self.schema:
             if pa.types.is_timestamp(field.type):
-                converters.append(lambda x: x)
+                converters.append(make_timestamp_converter())
             elif field.name == 'value_gpu' or pa.types.is_floating(field.type):
-                converters.append(lambda x: float(x) if x is not None else 0.0)
+                converters.append(make_float_converter())
             elif pa.types.is_integer(field.type):
-                converters.append(lambda x: int(x) if x is not None else 0)
+                converters.append(make_int_converter())
             else:
-                converters.append(lambda x: str(x) if x is not None else '')
+                converters.append(make_str_converter())
         return converters
 
     def process_batch(self, rows: list) -> bytes:
-        arrays = [[] for _ in range(len(self.schema))]
+        # Clear arrays for reuse
+        for arr in self.arrays:
+            arr.clear()
 
+        # Process rows in bulk
         for row in rows:
             for i, (value, converter) in enumerate(zip(row, self.field_converters)):
-                arrays[i].append(converter(value))
+                self.arrays[i].append(converter(value))
 
+        # Create Arrow arrays efficiently
         arrow_arrays = [pa.array(col, type=field.type)
-                        for col, field in zip(arrays, self.schema)]
+                       for col, field in zip(self.arrays, self.schema)]
 
+        # Optimize record batch creation
         record_batch = pa.RecordBatch.from_arrays(arrow_arrays, schema=self.schema)
         sink = pa.BufferOutputStream()
         with ipc.new_stream(sink, record_batch.schema) as writer:
@@ -290,14 +308,28 @@ async def get_schema(query: str) -> Tuple[pa.Schema, Dict]:
 
     return pa.schema(fields), schema_info
 
+
 async def process_partition(partition: QueryPartition, publisher: FastParallelPublisher,
-                          batch_processor: OptimizedBatchProcessor) -> int:
+                            batch_processor: OptimizedBatchProcessor) -> int:
     rows_processed = 0
 
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
+            # Add query optimization hints
+            cursor.execute("SET work_mem = '256MB'")
+            cursor.execute("SET temp_buffers = '256MB'")
+            cursor.execute("SET maintenance_work_mem = '256MB'")
+            cursor.execute("SET random_page_cost = 1.0")
+            cursor.execute("SET effective_cache_size = '2GB'")
+            cursor.execute("SET enable_parallel_append = on")
+            cursor.execute("SET parallel_tuple_cost = 0")
+            cursor.execute("SET parallel_setup_cost = 0")
+
+            # Optimize the query with parallel hints
             cursor.execute(f"""
-                SELECT * FROM ({partition.query}) t 
+                SELECT /*+ PARALLEL({PARALLEL_QUERIES}) */
+                    *
+                FROM ({partition.query}) t 
                 OFFSET {partition.start_offset} 
                 LIMIT {partition.end_offset - partition.start_offset}
             """)
