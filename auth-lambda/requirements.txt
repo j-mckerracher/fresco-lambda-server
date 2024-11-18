@@ -1,3 +1,0 @@
-boto3
-PyJWT~=2.9.0
-botocore~=1.35.36

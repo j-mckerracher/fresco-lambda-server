@@ -1,9 +1,18 @@
 # Core dependencies
-numpy<2.0.0  # Pin to numpy 1.x to avoid compatibility issues
-pyarrow>=12.0.1,<13.0.0  # Use a stable version compatible with numpy 1.x
-psycopg2-binary>=2.9.9  # Use binary distribution for easier installation
+numpy>=1.24.0,<2.0.0  # Pin to numpy 1.x for stability
+pyarrow>=12.0.1,<13.0.0  # Stable version compatible with numpy 1.x
+psycopg2-binary>=2.9.9  # Binary distribution for easier installation
 sqlparse>=0.4.4
 boto3>=1.29.0
 botocore>=1.32.0
-pandas
-psutil
+pandas>=2.0.0,<3.0.0  # Specify pandas version for compatibility
+psutil>=5.9.0  # System monitoring utilities
+orjson>=3.9.0  # Fast JSON parser/serializer
+asyncpg>=0.29.0  # Async PostgreSQL driver
+
+# Additional required dependencies
+lz4>=4.3.2  # Fast compression library (corrected from python-lz4)
+python-dateutil>=2.8.2  # Date utilities required by pandas
+typing-extensions>=4.7.0  # Type hinting support
+aioboto3>=11.0.0  # Async support for boto3
+aiohttp>=3.9.0  # Async HTTP client/server
