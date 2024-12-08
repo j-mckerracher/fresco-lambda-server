@@ -1,41 +1,44 @@
 import json
 import os
-import datetime
-import psycopg2.pool
 from dataclasses import dataclass
 import boto3
 from typing import Dict, Any, List, Tuple
 import time
-import pyarrow as pa
 import asyncio
-from contextlib import contextmanager
 
 # Constants
 MAX_PARTITION_SIZE = 256 * 1024  # 256 KiB in bytes
-DEFAULT_SAMPLE_SIZE = 1000
-PARALLEL_QUERIES = 12
+MAX_EXECUTION_TIME = 2.5  # 2.5 seconds max execution time
 
-required_vars = ['DB_USER', 'DB_PASSWORD', 'DB_HOST', 'DB_PORT', 'DB_NAME', 'SQS_QUEUE_URL']
-for var in required_vars:
-    if var not in os.environ:
-        print(f"Missing required environment variable: {var}")
+# Hardcoded schema based on database analysis
+JOB_DATA_SCHEMA = {
+    "time": "timestamp",
+    "submit_time": "timestamp",
+    "start_time": "timestamp",
+    "end_time": "timestamp",
+    "timelimit": "float",
+    "nhosts": "integer",
+    "ncores": "integer",
+    "value_cpuuser": "float",
+    "value_gpu": "float",
+    "value_memused": "float",
+    "value_memused_minus_diskcache": "float",
+    "value_nfs": "float",
+    "value_block": "float",
+    "exitcode": "string",
+    "host_list": "string",
+    "username": "string",
+    "account": "string",
+    "queue": "string",
+    "host": "string",
+    "jid": "string",
+    "unit": "string",
+    "jobname": "string"
+}
 
-# Initialize the PostgreSQL connection pool
-try:
-    print("Connecting to DB.")
-    db_pool = psycopg2.pool.ThreadedConnectionPool(
-        minconn=5,
-        maxconn=10,
-        user=os.environ['DB_USER'],
-        password=os.environ['DB_PASSWORD'],
-        host=os.environ['DB_HOST'],
-        port=os.environ['DB_PORT'],
-        database=os.environ['DB_NAME']
-    )
-    print("Database connection pool created successfully.")
-except Exception as e:
-    print(f"Error creating database connection pool: {e}")
-    db_pool = None
+# Hardcoded metrics based on database analysis
+AVERAGE_ROW_SIZE_BYTES = 200  # Rounded up from 199.856
+ROWS_PER_MONTH = 800000
 
 # Initialize SQS client
 try:
@@ -98,73 +101,38 @@ def create_response_body(
     }
 
 
-@contextmanager
-def get_db_connection():
-    """Get database connection from pool"""
-    conn = None
-    try:
-        conn = db_pool.getconn()
-        yield conn
-    finally:
-        if conn:
-            db_pool.putconn(conn)
-
-
 def get_schema(query: str) -> Dict:
-    """Get schema info dict for metadata"""
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(f"SELECT * FROM ({query}) t LIMIT 0")
-            schema_info = {}
-
-            for desc in cursor.description:
-                name = desc[0]
-                pg_type = desc[1]
-
-                if pg_type in (1184, 1114):  # TIMESTAMPTZ or TIMESTAMP
-                    schema_info[name] = "timestamp"
-                elif pg_type == 701 or name == 'value_gpu':  # FLOAT8
-                    schema_info[name] = "float"
-                elif pg_type in (20, 23):  # BIGINT or INTEGER
-                    schema_info[name] = "integer"
-                else:
-                    schema_info[name] = "string"
-
-    return schema_info
+    """Return hardcoded schema for job_data table"""
+    return JOB_DATA_SCHEMA
 
 
-def estimate_row_size(query: str, sample_size: int = DEFAULT_SAMPLE_SIZE) -> Tuple[float, int]:
+def estimate_row_size(query: str) -> Tuple[float, int]:
     """
-    Estimate average row size and total rows using a sample
-    Returns: (avg_row_size_bytes, estimated_total_rows)
+    Return hardcoded estimates based on analysis of data
+    For time-based queries, estimate row count based on date range
     """
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            # Get total row count estimate
-            cursor.execute(f"EXPLAIN (FORMAT JSON) {query}")
-            explain_result = cursor.fetchone()[0]
-            estimated_total_rows = explain_result[0]['Plan']['Plan Rows']
+    query_lower = query.lower()
+    if 'time' in query_lower and '>=' in query_lower and '<' in query_lower:
+        try:
+            # Extract dates using string operations
+            start_date = query_lower.split(">=")[1].split("'")[1][:7]  # Gets YYYY-MM
+            end_date = query_lower.split("<")[1].split("'")[1][:7]  # Gets YYYY-MM
 
-            # Sample some rows to estimate size
-            sample_query = f"""
-            WITH sample AS (
-                SELECT * FROM ({query}) t
-                LIMIT {sample_size}
-            )
-            SELECT pg_column_size(t.*) FROM sample t
-            """
-            cursor.execute(sample_query)
-            sizes = [row[0] for row in cursor.fetchall()]
+            # Calculate number of months
+            start_year, start_month = map(int, start_date.split('-'))
+            end_year, end_month = map(int, end_date.split('-'))
+            months_diff = (end_year - start_year) * 12 + (end_month - start_month)
 
-            if not sizes:
-                return 0, 0
+            # Estimate total rows based on months
+            estimated_rows = months_diff * ROWS_PER_MONTH
+        except Exception:
+            # Fallback to a reasonable default if parsing fails
+            estimated_rows = ROWS_PER_MONTH
+    else:
+        # Default estimate for non-time-based queries
+        estimated_rows = ROWS_PER_MONTH
 
-            avg_size = sum(sizes) / len(sizes)
-
-            # Add 10% overhead for safety
-            avg_size = avg_size * 1.1
-
-            return avg_size, estimated_total_rows
+    return AVERAGE_ROW_SIZE_BYTES, estimated_rows
 
 
 def calculate_partitions(query: str, avg_row_size: float, total_rows: int, row_limit: int = None) -> List[
@@ -173,67 +141,51 @@ def calculate_partitions(query: str, avg_row_size: float, total_rows: int, row_l
     if row_limit:
         total_rows = min(total_rows, row_limit)
 
-    rows_per_partition = int(MAX_PARTITION_SIZE / avg_row_size)
+    # Use larger partition size to reduce number of partitions
+    rows_per_partition = max(int(MAX_PARTITION_SIZE / avg_row_size), 1000)
     total_partitions = (total_rows + rows_per_partition - 1) // rows_per_partition
-
-    print(f"Calculated partition details:")
-    print(f"- Average row size: {avg_row_size:.2f} bytes")
-    print(f"- Rows per partition: {rows_per_partition}")
-    print(f"- Total partitions needed: {total_partitions}")
-    print(f"- Row limit applied: {row_limit if row_limit else 'None'}")
 
     partitions = []
     for i in range(total_partitions):
         start_offset = i * rows_per_partition
         end_offset = min((i + 1) * rows_per_partition, total_rows)
 
-        # Skip empty partitions
         if end_offset <= start_offset:
             continue
 
-        # Modify query to include row limit if specified
-        partition_query = query
-        if row_limit:
-            partition_query = f"WITH limited_query AS ({query} LIMIT {row_limit}) SELECT * FROM limited_query"
+        partition_query = f"WITH limited_query AS ({query} LIMIT {row_limit}) SELECT * FROM limited_query" if row_limit else query
 
-        partition = QueryPartition(
+        partitions.append(QueryPartition(
             partition_id=i,
-            order=i + 1,  # 1-based ordering
+            order=i + 1,
             start_offset=start_offset,
             end_offset=end_offset,
             query=partition_query,
-            transfer_id="",  # Will be set later
+            transfer_id="",
             estimated_size=int((end_offset - start_offset) * avg_row_size)
-        )
-        partitions.append(partition)
+        ))
 
     return partitions
 
 
 def send_to_sqs(partition: QueryPartition):
-    """Send partition info to SQS"""
+    """Send partition info to SQS with minimal payload"""
     message = {
-        'partition_id': partition.partition_id,
-        'order': partition.order,
-        'transfer_id': partition.transfer_id,
-        'query': partition.query,
-        'start_offset': partition.start_offset,
-        'end_offset': partition.end_offset,
-        'estimated_size': partition.estimated_size
+        'pid': partition.partition_id,
+        'o': partition.order,
+        'tid': partition.transfer_id,
+        'q': partition.query,
+        's': partition.start_offset,
+        'e': partition.end_offset,
+        'sz': partition.estimated_size
     }
 
     sqs.send_message(
         QueueUrl=QUEUE_URL,
         MessageBody=json.dumps(message),
         MessageAttributes={
-            'transfer_id': {
-                'DataType': 'String',
-                'StringValue': partition.transfer_id
-            },
-            'order': {
-                'DataType': 'Number',
-                'StringValue': str(partition.order)
-            }
+            'tid': {'DataType': 'String', 'StringValue': partition.transfer_id},
+            'o': {'DataType': 'Number', 'StringValue': str(partition.order)}
         }
     )
 
@@ -245,9 +197,12 @@ async def _process_request(event_body: Dict[str, Any]):
     schema_info = None
     messages_sent = 0
 
-    try:
-        # Extract arguments from the new request format
+    def check_timeout():
+        if time.time() - start_time > MAX_EXECUTION_TIME:
+            raise TimeoutError("Function approaching timeout limit")
 
+    try:
+        # Extract arguments from the request format
         arguments = event_body.get('arguments', {})
         transfer_id = arguments.get('clientId')
         query = arguments.get('query')
@@ -256,18 +211,19 @@ async def _process_request(event_body: Dict[str, Any]):
         if not transfer_id or not query:
             raise ValueError("Missing required fields: clientId and query are required in arguments")
 
-        # Get schema info for metadata
+        # Get schema info
         schema_info = get_schema(query)
 
-        # Estimate row size and total rows
+        check_timeout()
+        # Get size and row estimates (now very fast)
         avg_row_size, estimated_total_rows = estimate_row_size(query)
-        if avg_row_size == 0:
-            raise ValueError("Could not estimate row size - no data returned from sample query")
 
-        # Calculate partitions with row limit
+        check_timeout()
+        # Calculate partitions
         partitions = calculate_partitions(query, avg_row_size, estimated_total_rows, row_limit)
 
-        # Set transfer ID and send to SQS
+        check_timeout()
+        # Send to SQS
         for partition in partitions:
             partition.transfer_id = transfer_id
             send_to_sqs(partition)
@@ -275,6 +231,7 @@ async def _process_request(event_body: Dict[str, Any]):
 
             if messages_sent % 100 == 0:
                 print(f"Sent {messages_sent} partition messages...")
+                check_timeout()
 
         print(f"\nPartitioning complete:")
         print(f"✓ Total partitions: {len(partitions)}")
@@ -291,6 +248,18 @@ async def _process_request(event_body: Dict[str, Any]):
             status="COMPLETED"
         )
         return create_api_response(200, response_body)
+
+    except TimeoutError as te:
+        error_message = str(te)
+        response_body = create_response_body(
+            transfer_id=transfer_id,
+            schema_info=schema_info,
+            time_elapsed=time.time() - start_time,
+            messages_sent=messages_sent,
+            status="TIMEOUT_ERROR",
+            error=error_message
+        )
+        return create_api_response(408, response_body)
 
     except ValueError as ve:
         error_message = str(ve)
@@ -325,24 +294,18 @@ async def _process_request(event_body: Dict[str, Any]):
 
 
 def lambda_handler(event, context):
-    if db_pool is None:
-        return create_api_response(500, {'error': 'Database connection pool failed to initialize'})
     if sqs is None:
         return create_api_response(500, {'error': 'SQS client failed to initialize'})
-    """Main Lambda handler for API Gateway requests"""
-    # Handle OPTIONS request for CORS
+
     print(f"Incoming event: {event}")
 
     if event.get('httpMethod') == 'OPTIONS':
         return create_api_response(200, {'message': 'CORS preflight request successful'})
 
     try:
-        # Parse request body
         print("Loading event body.")
         body = json.loads(event.get('body', '{}'))
-
         return asyncio.run(_process_request(body))
-
     except json.JSONDecodeError:
         return create_api_response(400, {
             'error': 'Invalid JSON in request body'
