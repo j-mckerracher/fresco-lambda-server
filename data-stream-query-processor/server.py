@@ -198,6 +198,7 @@ def send_to_sqs(data: bytes, metadata: Dict[str, Any]):
 
 def lambda_handler(event, context):
     try:
+        print(f"incoming message: {event}")
         for record in event['Records']:
             message = json.loads(record['body'])
             print(f"\nProcessing partition {message['partition_id']} "

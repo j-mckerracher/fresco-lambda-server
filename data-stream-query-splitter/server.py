@@ -169,23 +169,30 @@ def calculate_partitions(query: str, avg_row_size: float, total_rows: int, row_l
 
 
 def send_to_sqs(partition: QueryPartition):
-    """Send partition info to SQS with minimal payload"""
+    """Send partition info to SQS with fields matching Lambda 2's expectations"""
     message = {
-        'pid': partition.partition_id,
-        'o': partition.order,
-        'tid': partition.transfer_id,
-        'q': partition.query,
-        's': partition.start_offset,
-        'e': partition.end_offset,
-        'sz': partition.estimated_size
+        'partition_id': partition.partition_id,  # Changed from 'pid'
+        'order': partition.order,                # Changed from 'o'
+        'transfer_id': partition.transfer_id,    # Changed from 'tid'
+        'query': partition.query,                # Changed from 'q'
+        'start_offset': partition.start_offset,  # Changed from 's'
+        'end_offset': partition.end_offset,      # Changed from 'e'
+        'estimated_size': partition.estimated_size,  # Changed from 'sz'
+        'schema_info': JOB_DATA_SCHEMA  # Add schema info that Lambda 2 needs
     }
 
     sqs.send_message(
         QueueUrl=QUEUE_URL,
         MessageBody=json.dumps(message),
         MessageAttributes={
-            'tid': {'DataType': 'String', 'StringValue': partition.transfer_id},
-            'o': {'DataType': 'Number', 'StringValue': str(partition.order)}
+            'transfer_id': {
+                'DataType': 'String',
+                'StringValue': partition.transfer_id
+            },
+            'order': {
+                'DataType': 'Number',
+                'StringValue': str(partition.order)
+            }
         }
     )
 
