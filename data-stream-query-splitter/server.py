@@ -8,7 +8,7 @@ import asyncio
 
 # Constants
 MAX_PARTITION_SIZE = 256 * 1024  # 256 KiB in bytes
-MAX_EXECUTION_TIME = 2.5  # 2.5 seconds max execution time
+MAX_EXECUTION_TIME = float(os.getenv('MAX_RUN_TIME', '5'))  # Convert string to float
 
 # Hardcoded schema based on database analysis
 JOB_DATA_SCHEMA = {
@@ -112,7 +112,12 @@ def estimate_row_size(query: str) -> Tuple[float, int]:
     For time-based queries, estimate row count based on date range
     """
     query_lower = query.lower()
-    if 'time' in query_lower and '>=' in query_lower and '<' in query_lower:
+
+    # Only try to parse dates if the query contains both time constraints
+    if ('time' in query_lower and
+            '>=' in query_lower and
+            '<' in query_lower and
+            "'" in query_lower):  # Ensure there are quoted strings
         try:
             # Extract dates using string operations
             start_date = query_lower.split(">=")[1].split("'")[1][:7]  # Gets YYYY-MM
@@ -125,8 +130,8 @@ def estimate_row_size(query: str) -> Tuple[float, int]:
 
             # Estimate total rows based on months
             estimated_rows = months_diff * ROWS_PER_MONTH
-        except Exception:
-            # Fallback to a reasonable default if parsing fails
+        except Exception as e:
+            print(f"Date parsing failed: {e}, using default estimate")
             estimated_rows = ROWS_PER_MONTH
     else:
         # Default estimate for non-time-based queries
@@ -214,6 +219,8 @@ async def _process_request(event_body: Dict[str, Any]):
         transfer_id = arguments.get('clientId')
         query = arguments.get('query')
         row_limit = arguments.get('rowLimit')
+
+        print(f"Arguments from request: {arguments}")
 
         if not transfer_id or not query:
             raise ValueError("Missing required fields: clientId and query are required in arguments")
