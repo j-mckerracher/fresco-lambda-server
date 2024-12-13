@@ -1,0 +1,3 @@
+# Core dependencies
+boto3>=1.29.0
+botocore>=1.32.0
