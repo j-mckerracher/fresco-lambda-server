@@ -83,7 +83,9 @@ def create_response_body(
         estimated_rows: int = 0,
         messages_sent: int = 0,
         status: str = "COMPLETED",
-        error: str = None
+        error: str = None,
+        total_chunks: int = 0,
+        total_partitions: int = 0
 ) -> Dict[str, Any]:
     """Create response body"""
     return {
@@ -96,7 +98,9 @@ def create_response_body(
             "estimatedRows": estimated_rows,
             "messagesSent": messages_sent,
             "processingStatus": status,
-            "error": error
+            "error": error,
+            "totalChunks": total_chunks,
+            "total_partitions": total_partitions
         }
     }
 
@@ -159,6 +163,7 @@ def calculate_partitions(query: str, avg_row_size: float, total_rows: int, row_l
             continue
 
         partition_query = f"WITH limited_query AS ({query} LIMIT {row_limit}) SELECT * FROM limited_query" if row_limit else query
+        print(f"partition_query = {partition_query}")
 
         partitions.append(QueryPartition(
             partition_id=i,
@@ -170,20 +175,23 @@ def calculate_partitions(query: str, avg_row_size: float, total_rows: int, row_l
             estimated_size=int((end_offset - start_offset) * avg_row_size)
         ))
 
+    print(f"Partitions: {partitions}")
     return partitions
 
 
-def send_to_sqs(partition: QueryPartition):
+def send_to_sqs(partition: QueryPartition, total_rows: int, total_partitions: int):
     """Send partition info to SQS with fields matching Lambda 2's expectations"""
     message = {
-        'partition_id': partition.partition_id,  # Changed from 'pid'
-        'order': partition.order,                # Changed from 'o'
-        'transfer_id': partition.transfer_id,    # Changed from 'tid'
-        'query': partition.query,                # Changed from 'q'
-        'start_offset': partition.start_offset,  # Changed from 's'
-        'end_offset': partition.end_offset,      # Changed from 'e'
-        'estimated_size': partition.estimated_size,  # Changed from 'sz'
-        'schema_info': JOB_DATA_SCHEMA  # Add schema info that Lambda 2 needs
+        'partition_id': partition.partition_id,
+        'order': partition.order,
+        'transfer_id': partition.transfer_id,
+        'query': partition.query,
+        'start_offset': partition.start_offset,
+        'end_offset': partition.end_offset,
+        'estimated_size': partition.estimated_size,
+        'schema_info': JOB_DATA_SCHEMA,
+        'total_rows': total_rows,
+        'total_partitions': total_partitions
     }
 
     sqs.send_message(
@@ -229,18 +237,24 @@ async def _process_request(event_body: Dict[str, Any]):
         schema_info = get_schema(query)
 
         check_timeout()
-        # Get size and row estimates (now very fast)
+        # Get size and row estimates
         avg_row_size, estimated_total_rows = estimate_row_size(query)
+
+        # Calculate actual total rows based on row_limit if provided
+        total_rows = min(estimated_total_rows, row_limit) if row_limit else estimated_total_rows
 
         check_timeout()
         # Calculate partitions
-        partitions = calculate_partitions(query, avg_row_size, estimated_total_rows, row_limit)
+        partitions = calculate_partitions(query, avg_row_size, total_rows, row_limit)
+
+        # Calculate total chunks (unique queries)
+        total_chunks = 1 if row_limit else 1  # Currently each partition uses the same query
 
         check_timeout()
-        # Send to SQS
+        # Send to SQS with total rows information
         for partition in partitions:
             partition.transfer_id = transfer_id
-            send_to_sqs(partition)
+            send_to_sqs(partition, total_rows, len(partitions))
             messages_sent += 1
 
             if messages_sent % 100 == 0:
@@ -251,15 +265,19 @@ async def _process_request(event_body: Dict[str, Any]):
         print(f"✓ Total partitions: {len(partitions)}")
         print(f"✓ Average partition size: {MAX_PARTITION_SIZE / 1024:.2f} KiB")
         print(f"✓ Total messages sent: {messages_sent}")
+        print(f"✓ Total expected rows: {total_rows:,}")
+        print(f"✓ Total unique queries: {total_chunks}")
 
         response_body = create_response_body(
             transfer_id=transfer_id,
             partitions_count=len(partitions),
             schema_info=schema_info,
             time_elapsed=time.time() - start_time,
-            estimated_rows=min(estimated_total_rows, row_limit) if row_limit else estimated_total_rows,
+            estimated_rows=total_rows,
             messages_sent=messages_sent,
-            status="COMPLETED"
+            status="COMPLETED",
+            total_chunks=total_chunks,
+            total_partitions=len(partitions)
         )
         return create_api_response(200, response_body)
 
@@ -271,7 +289,8 @@ async def _process_request(event_body: Dict[str, Any]):
             time_elapsed=time.time() - start_time,
             messages_sent=messages_sent,
             status="TIMEOUT_ERROR",
-            error=error_message
+            error=error_message,
+            total_chunks=0  # Add total_chunks in error case
         )
         return create_api_response(408, response_body)
 
@@ -283,7 +302,8 @@ async def _process_request(event_body: Dict[str, Any]):
             time_elapsed=time.time() - start_time,
             messages_sent=messages_sent,
             status="VALIDATION_ERROR",
-            error=error_message
+            error=error_message,
+            total_chunks=0  # Add total_chunks in error case
         )
         return create_api_response(400, response_body)
 
@@ -302,7 +322,8 @@ async def _process_request(event_body: Dict[str, Any]):
             time_elapsed=execution_time,
             messages_sent=messages_sent,
             status=error_type,
-            error=error_message
+            error=error_message,
+            total_chunks=0  # Add total_chunks in error case
         )
         return create_api_response(500, response_body)
 

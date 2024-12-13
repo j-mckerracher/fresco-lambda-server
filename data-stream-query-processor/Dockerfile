@@ -1,5 +1,5 @@
 # Use the official AWS Lambda Python 3.9 base image
-FROM public.ecr.aws/lambda/python:3.9
+FROM public.ecr.aws/lambda/python:3.12
 
 # Set working directory
 WORKDIR ${LAMBDA_TASK_ROOT}

@@ -10,13 +10,11 @@ import zlib
 
 # Constants
 MAX_MQTT_PAYLOAD_SIZE = 128 * 1024
-MAX_PUBLISHER_THREADS = 10
-MAX_RETRIES = 3
+PUBLISH_RATE_LIMIT = 90  # publishes per second
+MINIMUM_PUBLISH_INTERVAL = 1.0 / PUBLISH_RATE_LIMIT
 
 print(f"Starting application with configuration:")
 print(f"MAX_MQTT_PAYLOAD_SIZE: {MAX_MQTT_PAYLOAD_SIZE:,} bytes")
-print(f"MAX_PUBLISHER_THREADS: {MAX_PUBLISHER_THREADS}")
-print(f"MAX_RETRIES: {MAX_RETRIES}")
 
 # Initialize clients
 try:
@@ -34,14 +32,17 @@ except Exception as e:
     s3 = None
 
 
-class FastPublisher:
+class RateLimitedPublisher:
     def __init__(self):
-        print(f"Initializing FastPublisher with {MAX_PUBLISHER_THREADS} threads")
-        self.executor = ThreadPoolExecutor(max_workers=MAX_PUBLISHER_THREADS)
+        print(f"Initializing RateLimitedPublisher")
+        print(f"Target rate: {PUBLISH_RATE_LIMIT} messages per second")
+        print(f"Minimum interval: {MINIMUM_PUBLISH_INTERVAL:.4f} seconds")
+
         self.sequence_number = 0
         self.sequence_lock = threading.Lock()
         self.transfer_stats: Dict[str, Dict] = {}
         self.stats_lock = threading.Lock()
+        self.last_publish_time = 0
         self.preview_shown = False
 
     def _get_next_sequence(self, transfer_id: str) -> int:
@@ -51,7 +52,8 @@ class FastPublisher:
                 self.transfer_stats[transfer_id] = {
                     'sequence': 0,
                     'published': 0,
-                    'bytes_published': 0
+                    'bytes_published': 0,
+                    'start_time': time.time()
                 }
             self.transfer_stats[transfer_id]['sequence'] += 1
             return self.transfer_stats[transfer_id]['sequence']
@@ -60,10 +62,17 @@ class FastPublisher:
         with self.stats_lock:
             self.transfer_stats[transfer_id]['published'] += 1
             self.transfer_stats[transfer_id]['bytes_published'] += data_size
-            if self.transfer_stats[transfer_id]['published'] % 100 == 0:
-                print(f"Transfer progress - ID: {transfer_id}")
-                print(f"- Messages published: {self.transfer_stats[transfer_id]['published']}")
-                print(f"- Total bytes: {self.transfer_stats[transfer_id]['bytes_published']:,}")
+
+            stats = self.transfer_stats[transfer_id]
+            elapsed_time = time.time() - stats['start_time']
+            current_rate = stats['published'] / elapsed_time if elapsed_time > 0 else 0
+
+            if self.transfer_stats[transfer_id]['published'] % 50 == 0:
+                print(f"\nTransfer progress - ID: {transfer_id}")
+                print(f"- Messages published: {stats['published']}")
+                print(f"- Total bytes: {stats['bytes_published']:,}")
+                print(f"- Current publish rate: {current_rate:.1f} messages/second")
+                print(f"- Elapsed time: {elapsed_time:.1f} seconds")
 
     def _chunk_data(self, data: bytes, metadata: Dict) -> list:
         """Split data into MQTT-compatible chunks"""
@@ -91,9 +100,22 @@ class FastPublisher:
         print(f"- Created {len(chunks)} chunks")
         return chunks
 
+    def _enforce_rate_limit(self):
+        """Enforce publish rate limit using sleep"""
+        current_time = time.time()
+        time_since_last_publish = current_time - self.last_publish_time
+
+        if time_since_last_publish < MINIMUM_PUBLISH_INTERVAL:
+            sleep_time = MINIMUM_PUBLISH_INTERVAL - time_since_last_publish
+            time.sleep(sleep_time)
+
+        self.last_publish_time = time.time()
+
     def _publish_message(self, message: Dict, retry_count: int = 0):
-        """Publish message to IoT Core with retries"""
+        """Publish message to IoT Core with rate limiting and retries"""
         try:
+            self._enforce_rate_limit()
+
             payload = json.dumps(message)
             payload_size = len(payload.encode('utf-8'))
 
@@ -114,11 +136,10 @@ class FastPublisher:
                 len(message['data']) * 3 // 4
             )
 
-            if (message['metadata']['sequence'] % 100 == 0 or
+            if (message['metadata']['sequence'] % 50 == 0 or
                     message['metadata']['sequence'] == 1):
                 print(f"\nMessage published successfully:")
                 print(f"- Transfer ID: {message['metadata']['transfer_id']}")
-                print(f"- Order: {message['metadata']['order']}")
                 print(f"- Sequence: {message['metadata']['sequence']}")
                 print(f"- Size: {payload_size:,} bytes")
                 print(f"- Publish time: {publish_time:.3f} seconds")
@@ -138,7 +159,7 @@ class FastPublisher:
                 raise Exception(f"Failed to publish after {MAX_RETRIES} attempts: {str(e)}")
 
     def publish_data(self, data: bytes, metadata: Dict):
-        """Process and publish data"""
+        """Process and publish data with rate limiting"""
         print(f"\nStarting new data publication:")
         print(f"- Transfer ID: {metadata['transfer_id']}")
         print(f"- Data size: {len(data):,} bytes")
@@ -147,10 +168,10 @@ class FastPublisher:
         total_chunks = len(chunks)
         transfer_id = metadata['transfer_id']
 
-        print(f"\nSubmitting publish tasks:")
+        print(f"\nStarting publish process:")
         print(f"- Total chunks: {total_chunks}")
+        print(f"- Target rate: {PUBLISH_RATE_LIMIT} messages/second")
 
-        futures = []
         for chunk_index, chunk in enumerate(chunks):
             sequence = self._get_next_sequence(transfer_id)
 
@@ -169,11 +190,7 @@ class FastPublisher:
                 'data': base64.b64encode(chunk).decode('utf-8')
             }
 
-            futures.append(self.executor.submit(self._publish_message, message))
-
-        print(f"Waiting for {len(futures)} publish tasks to complete...")
-        for future in futures:
-            future.result()
+            self._publish_message(message)
 
     def get_stats(self, transfer_id: str) -> Dict:
         """Get publishing statistics for a transfer"""
@@ -181,8 +198,13 @@ class FastPublisher:
             stats = self.transfer_stats.get(transfer_id, {
                 'sequence': 0,
                 'published': 0,
-                'bytes_published': 0
+                'bytes_published': 0,
+                'start_time': time.time()
             }).copy()
+
+            elapsed_time = time.time() - stats['start_time']
+            stats['publish_rate'] = stats['published'] / elapsed_time if elapsed_time > 0 else 0
+
             return stats
 
 
@@ -190,14 +212,28 @@ def lambda_handler(event, context):
     print("\n=== Lambda Handler Started ===")
     print(f"Event Records: {len(event['Records'])}")
 
-    publisher = FastPublisher()
+    # Constants
+    MAX_BATCH_SIZE = 100
+    SQS_QUEUE_URL = os.environ['SQS_QUEUE_URL']
+
     start_time = time.time()
+    publisher = RateLimitedPublisher()
+    sqs = boto3.client('sqs')
 
     try:
-        for index, record in enumerate(event['Records'], 1):
-            print(f"\nProcessing record {index}/{len(event['Records'])}")
+        # Split records into current batch and remaining
+        current_batch = event['Records'][:MAX_BATCH_SIZE]
+        remaining_records = event['Records'][MAX_BATCH_SIZE:]
+
+        print(f"\nProcessing batch of {len(current_batch)} records")
+        print(f"Remaining records to be requeued: {len(remaining_records)}")
+
+        # Process current batch
+        for index, record in enumerate(current_batch, 1):
+            print(f"\nProcessing record {index}/{len(current_batch)}")
             message = json.loads(record['body'])
 
+            # Get data either from S3 or direct message
             if 's3_reference' in message:
                 print(f"Fetching data from S3:")
                 print(f"- Bucket: {message['s3_reference']['bucket']}")
@@ -218,32 +254,55 @@ def lambda_handler(event, context):
                 data = bytes.fromhex(message['data'])
                 print(f"- Data size: {len(data):,} bytes")
 
+            # Publish the data
             publisher.publish_data(data, {
                 k: v for k, v in message.items()
                 if k != 'data' and k != 's3_reference'
             })
 
+        # Requeue remaining records if any
+        if remaining_records:
+            print(f"\nRequeueing {len(remaining_records)} remaining records")
+            for record in remaining_records:
+                try:
+                    sqs.send_message(
+                        QueueUrl=SQS_QUEUE_URL,
+                        MessageBody=record['body'],
+                        MessageAttributes=record.get('messageAttributes', {})
+                    )
+                except Exception as e:
+                    print(f"Error requeueing message: {str(e)}")
+                    raise
+
+            print(f"Successfully requeued {len(remaining_records)} records")
+
+        # Calculate execution statistics
         execution_time = time.time() - start_time
         stats = {
             transfer_id: publisher.get_stats(transfer_id)
             for transfer_id in publisher.transfer_stats
         }
 
+        # Log execution summary
         print("\n=== Execution Summary ===")
         print(f"✓ Time taken: {execution_time:.2f} seconds")
-        print(f"✓ Records processed: {len(event['Records'])}")
+        print(f"✓ Records processed in this batch: {len(current_batch)}")
+        print(f"✓ Records requeued: {len(remaining_records)}")
+
         for transfer_id, transfer_stats in stats.items():
             print(f"\n✓ Transfer {transfer_id}:")
             print(f"  - Messages published: {transfer_stats['published']}")
             print(f"  - Total data: {transfer_stats['bytes_published']:,} bytes")
             print(
-                f"  - Average throughput: {transfer_stats['bytes_published'] / execution_time / 1024 / 1024:.2f} MB/s")
+                f"  - Average throughput: {transfer_stats['bytes_published'] / execution_time / 1024 / 1024:.2f} MB/s"
+            )
 
         return {
             'statusCode': 200,
             'body': {
-                'message': 'Successfully processed all records',
-                'record_count': len(event['Records']),
+                'message': 'Successfully processed batch',
+                'records_processed': len(current_batch),
+                'records_requeued': len(remaining_records),
                 'execution_time': execution_time,
                 'stats': stats
             }
@@ -256,6 +315,7 @@ def lambda_handler(event, context):
         print("\n=== Execution Failed ===")
         print(f"✗ Error occurred after {execution_time:.2f} seconds:")
         print(f"✗ Error message: {error_message}")
+
         print("\nPartial stats at time of failure:")
         for transfer_id in publisher.transfer_stats:
             stats = publisher.get_stats(transfer_id)
